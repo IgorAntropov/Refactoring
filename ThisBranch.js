@@ -1,4026 +1,3692 @@
-var CustomerInvoicesView = Backbone.View.extend({
+var CustomerInvoicesView = DocumentTableView.extend({
     el: '#invoices-content',
-    processedData: [],
-    paginationNewData: [],
-    flag: 0,
-    currentUmsatz: 'netto',
-    events: {
-        'click .show-delivery-note': 'selectDeliveryNote',
-        'click .show-invoice': 'selectInvoice',
-        // 'click .sortable': 'processAsInfinite',
-        'change #invoicesColumnItemOrderCreateTimestamp': 'changeCheckboxSetting',
-        'change #invoicesColumnItemCreateTimestamp': 'changeCheckboxSetting',
-        'change #invoicesColumnItemModifyTimestamp': 'changeCheckboxSetting',
-        'change #invoicesColumnItemCompletedTimestamp': 'changeCheckboxSetting',
-        'click #date-group-dropdown-invoice': 'replacementData',
-        'click .sortable': 'forSlowConnection',
-        'click input[name="umsatz"]': 'umsatzChanged'
-    },
+    events: {},
     template: _.template($('#invoices-content-tpl').html()),
     initialize: function (invoices, notes, customerId) {
         this.customerId = customerId;
-        var deletedNotes = notes.map(function (item) {
-            if (item.attributes.DeleteTimestamp !== '0000-00-00 00:00:00') {
-                var createDate = Date.parse(item.attributes.CreateTimestamp);
-                var deleteDate = Date.parse(item.attributes.DeleteTimestamp);
-                if (createDate < deleteDate) {
-                    return item.attributes.Id;
+        this.filter = {
+            InvoiceNumber: '',
+            OrderCreateTimestamp: '',
+            CreateTimestamp: '',
+            ModifyTimestamp: '',
+            CompletedTimestamp: '',
+            FormattedStatus: 'Alle',
+            paymentState: 'Alle',
+            sourceDeliveryNotes: '',
+            DeliveryNotesStatusFormatted: 'Alle'
+        };
+        this.optionsPaymentState = ['Alle'];
+        this.initializeCommonValues();
+
+        this.$parent_el = this.$el.closest('#invoice-list-modal');
+        this.$spinner = this.getSpinner();
+
+        this.$buttonPayment = this.$parent_el.find('#payment-button');
+        this.$buttonDownloadPdf = this.$parent_el.find('#download-pdf');
+        this.$buttonFinalize = this.$parent_el.find('#finalize-all-selected-invoice-button');
+        this.$buttonDeleteSelected = this.$parent_el.find('#delete-selected-invoice-button');
+
+        this.$buttonPageUp = this.$parent_el.find('.page-up-inv');
+        this.$buttonPageDown = this.$parent_el.find('.page-down-inv');
+
+        this.$buttonContraList = this.$parent_el.find('#open-delivery-notes');
+
+        this.currentPeriod = this.getPeriod();
+        this.moneyTurnover = this.getTurnoverSetting();
+
+        this.invoices = invoices;//if this.customerId > 0 => new Backbone.Collection(invoices.toJSON());
+        this.notes = notes;
+
+        this.listenTo(this.invoices, 'change', this.changeTable);
+        this.listenTo(this.invoices, 'remove', this.removeCollection);
+        this.listenTo(this.invoices, 'update', this.updateTable);
+        this.listenTo(this.invoices, 'reset', this.resetCollection);
+        this.listenTo(this.notes, 'change',  this.applyChangesDeliveryNote);
+    },
+    setSelectOptionPaymentState: function (_document) {
+        if (_document.paymentState !== '' && this.optionsPaymentState.indexOf(_document.paymentState) === -1)
+            this.optionsPaymentState.push(_document.paymentState);
+    },
+    closeView: function () {
+        this.hideParentElements();
+        this.stopListening();
+
+        App.instance.selectionModel.set('CustomerInvoicesView_CustomerId', 0);
+    },
+    getInvolvedContraDocumentFields: function () {
+        return ['FormattedStatus', 'DeliveryNoteNumber', 'DeliveryNoteNumberIsDefault'];
+    },
+    getInvoiceField: function (dn_field) {
+        let result = dn_field;
+        switch (dn_field) {
+            case 'DeliveryNoteNumber':
+                result = 'Number';
+                break;
+            case 'DeliveryNoteNumberIsDefault':
+                result = 'isDefaultNumber';
+                break;
+        }
+        return result;
+    },
+    applyChangesDeliveryNote: function (Note) {
+        let changes = Note.changed;
+        let note_id = Note.get('Id');
+        if(this.hasInvolvedField(changes)) {
+            let wasChangedStatusNote = changes.hasOwnProperty('FormattedStatus');
+            let thisInvoice = this.invoices.findInvoiceNote(note_id);
+            if (thisInvoice !== undefined) {
+                let sourceDeliveryNotes = thisInvoice.get('sourceDeliveryNotes');
+                let sourceDeliveryNotes_clone = [];
+                for (let i = 0; i < sourceDeliveryNotes.length; i++) {
+                    let clone = {};
+                    Object.assign(clone, sourceDeliveryNotes[i]);
+                    sourceDeliveryNotes_clone[i] = clone;
                 }
-            }
-        });
-        var invoicesData = invoices.models.map(function (item) {
-            item.attributes.deleted = false;
-            if (item.attributes.DeleteTimestamp !== '0000-00-00 00:00:00') {
-                var createDate = Date.parse(item.attributes.CreateTimestamp);
-                var deleteDate = Date.parse(item.attributes.DeleteTimestamp);
-                if (createDate < deleteDate) {
-                    item.attributes.deleted = true;
-                }
-            }
-            if (item.attributes.sourceDeliveryNotes != null) {
-                item.attributes.sourceDeliveryNotes.forEach(function (valueDn) {
-                    valueDn.deleted = false;
-                    if (deletedNotes.includes(valueDn.Id)) {
-                        valueDn.deleted = true;
+                let index_note = _.findIndex(sourceDeliveryNotes_clone, note => {
+                    return (note['Id'] === note_id);
+                });
+                if (index_note !== -1) {
+                    let note_fields = this.getInvolvedContraDocumentFields();
+                    for (let i = 0; i < note_fields.length; i++) {
+                        let source_field = this.getInvoiceField(note_fields[i]);
+                        sourceDeliveryNotes_clone[index_note][source_field] = Note.get(note_fields[i]);
                     }
-                });
-                item.attributes.sourceDeliveryNotes = $.grep(item.attributes.sourceDeliveryNotes, function(itemDn){
-                    return itemDn.deleted !== true;
-                });
-            }
-            return item;
-        });
-        invoicesData = $.grep(invoicesData, function(item){
-            return item.attributes.deleted !== true;
-        });
+                    let field_deliveryNotesStatusFormatted = (wasChangedStatusNote) ?
+                        this.getDeliveryNotesStatusFormattedField(sourceDeliveryNotes_clone) :
+                        thisInvoice.get('DeliveryNotesStatusFormatted');
 
-        invoices.models = invoicesData;
-        this.invoices = invoices;
-        this.deliveryNotes = notes;
-        this.invoices.on("change", this.update, this);
-        this.invoices.once("update", this.render, this);
-        var civ = this;
-        $('#invoice-scroll-listener').off().on('scroll', function () {
-            var sumHeight = this.scrollTop + this.offsetHeight + 10; // 10 - overlaps the error of interpretation for browsers
-            if (sumHeight >= this.scrollHeight) {
-                var lastShowed = 0;
-                civ.$el.find('tr').each(function () {
-                    if (this.style.display != 'none')
-                    {
-                        if ($(this).attr('data-index') != undefined) {
-                            lastShowed = $(this).attr('data-index');
-                        }
-                    }
-                });
-                civ.$el.find('tr').each(function () {
-                    if (parseInt($(this).attr('data-index')) > parseInt(lastShowed) && parseInt($(this).attr('data-index')) < parseInt(lastShowed) + 10) {
-                        $(this).show();
-                    }
-                });
-            }
-            $('.show-delivery-note').siblings().popover('hide');
-            $('.show-invoice').siblings().popover('hide');
-        });
-    },
-    update: function (collection) {
-        // if ($('#invCompletedTimestamp').prop("checked") == 'true') {
-        //     $('#invCompletedTimestamp').attr("checked","checked");
-        // } else {
-        //     $('#invCompletedTimestamp').removeAttr("checked");
-        // }
-        // if ($('#invModifyTimestamp').prop("checked") == 'true') {
-        //     $('#invModifyTimestamp').attr("checked","checked");
-        // } else {
-        //     $('#invModifyTimestamp').removeAttr("checked");
-        // }
-
-        if (this.customerId == 0) {
-            this.invoices.reset(collection.collection.models);
-        } else {
-            this.invoices.reset(collection.collection.where({CustomerId: this.customerId}));
-        }
-        this.render();
-        var self = this;
-        setTimeout(function () {
-            self.addRowsOnScroll(100);
-        }, 1000);
-    },
-    umsatzChanged: function(e) {
-        $('#tax-button').click();
-        selected_value = $('input[name="umsatz"]:checked').val();
-        if (selected_value == 'netto') {
-            $('#tax-button')[0].innerHTML = '<span>Netto</span> <span class="caret"></span>';
-            this.currentUmsatz = 'netto';
-            var elementsToShow = document.getElementsByClassName('revenueLine');
-            var elementsToHide = document.getElementsByClassName('revenueLineBruttoUmsatz');
-            _.each(elementsToShow, function (row) {
-                row.classList.remove("hided-content");
-            });
-            _.each(elementsToHide, function (row) {
-                row.classList.add("hided-content");
-            });
-        } else if (selected_value == 'brutto'){
-            $('#tax-button')[0].innerHTML = '<span>Brutto</span> <span class="caret"></span>';
-            this.currentUmsatz = 'brutto';
-            var elementsToShow = document.getElementsByClassName('revenueLineBruttoUmsatz');
-            var elementsToHide = document.getElementsByClassName('revenueLine');
-            _.each(elementsToShow, function (row) {
-                row.classList.remove("hided-content");
-            });
-            _.each(elementsToHide, function (row) {
-                row.classList.add("hided-content");
-            });
-        }
-
-        var self = this;
-        var codeSetting = 'taxInv_' + e.target.getAttribute('id').substring(e.target.getAttribute('id').indexOf('-') + 1,e.target.getAttribute('id').indexOf('-', e.target.getAttribute('id').indexOf('-') + 1));
-        var target = 'taxInv_';
-        var value = 'true';
-        var elements = ['taxInv_netto',
-            'taxInv_brutto'];
-
-        disabledElementForSlowConnection();
-
-        App.api.user.changeSetting.put(target, codeSetting, value).then(function (resp) {
-            var setting_value = resp.toString();
-            var settings = _.clone(App.instance.thisUser.get('setting'));
-
-            _.map(elements, function(element) {
-                if (element in settings) {
-                    return settings[element] = 'false';
-                }
-            });
-
-            if (settings) {
-                if (codeSetting in settings) {
-                    settings[codeSetting] = setting_value;
-                }
-            } else {
-                settings = [];
-                settings[codeSetting] = setting_value;
-            }
-            App.instance.thisUser.set('setting', settings);
-
-            includedElementForSlowConnection();
-        });
-    },
-    selectInvoice: function (e) {
-        var invoiceId = e.currentTarget.dataset.id;
-        if (window.innerWidth <= 480) {
-            if (this.flag == invoiceId) {
-                App.instance.selectionModel.set('SelectedInvoiceId', invoiceId);
-                $('.popover').hide();
-                this.flag = 0;
-            } else {
-                e.preventDefault();
-                e.stopPropagation();
-                $('.popover').hide();
-                $(e.target).popover('show');
-                this.flag = invoiceId;
-                setTimeout(function () {
-                    $('.popover').hide();
-                }, 3000);
-            }
-        } else {
-            App.instance.selectionModel.set('SelectedInvoiceId', invoiceId);
-        }
-    },
-    selectDeliveryNote: function (e) {
-        var deliveryNoteId = e.currentTarget.dataset.id;
-        if (window.innerWidth <= 480) {
-            if (this.flag == deliveryNoteId) {
-                App.instance.selectionModel.set('SelectedDeliveryNoteId', deliveryNoteId);
-                $('.popover').hide();
-                this.flag = 0;
-            } else {
-                e.preventDefault();
-                e.stopPropagation();
-                $('.popover').hide();
-                $(e.target).popover('show');
-                this.flag = deliveryNoteId;
-                setTimeout(function () {
-                    $('.popover').hide();
-                }, 3000);
-            }
-        } else {
-            App.instance.selectionModel.set('SelectedDeliveryNoteId', deliveryNoteId);
-        }
-    },
-    getAllSelectedInvoices: function () {
-        return this.$el.find('#invoices-table').bootstrapTable('getAllSelections');
-    },
-    render: function () {
-        var self = this;
-        var data = this.invoices.toJSON();
-        var todaySum = 0.0; //heute
-        var todayMarAbs = 0.0;
-        var todayMwst = 0.0;
-        var thisWeekSum = 0.0; //diese Woche
-        var thisWeekMarAbs = 0.0;
-        var thisWeekMwst = 0.0;
-        var thisMonthSum = 0.0; //diesen Monat
-        var thisMonthMarAbs = 0.0;
-        var thisMonthMwst = 0.0;
-        var thisYearSum = 0.0; //dieses Jahr
-        var thisYearMarAbs = 0.0;
-        var thisYearMwst = 0.0;
-        var documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor;
-        documentTextColor = todayTextColor = thisWeekTextColor = thisMonthTextColor = thisYearTextColor = '';
-
-        var $makePageUp = this.$el.closest('#invoice-list-modal').find('.page-up-dn');
-        var $makePageDown = this.$el.closest('#invoice-list-modal').find('.page-down-dn');
-        var $deleteSelectedButton = this.$el.closest('#invoice-list-modal').find('#delete-selected-invoice-button');
-
-        var dataForTopTable = this.recalculateTopTable(data);
-        todaySum = dataForTopTable.todaySum;
-        todayMarAbs = dataForTopTable.todayMarAbs;
-        todayMwst = dataForTopTable.todayMwst;
-        thisWeekSum = dataForTopTable.thisWeekSum;
-        thisWeekMarAbs = dataForTopTable.thisWeekMarAbs;
-        thisWeekMwst = dataForTopTable.thisWeekMwst;
-        thisMonthSum = dataForTopTable.thisMonthSum;
-        thisMonthMarAbs = dataForTopTable.thisMonthMarAbs;
-        thisMonthMwst = dataForTopTable.thisMonthMwst;
-        thisYearSum = dataForTopTable.thisYearSum;
-        thisYearMarAbs = dataForTopTable.thisYearMarAbs;
-        thisYearMwst = dataForTopTable.thisYearMwst;
-        documentTextColor = dataForTopTable.documentTextColor;
-        todayTextColor = dataForTopTable.todayTextColor;
-        thisWeekTextColor = dataForTopTable.thisWeekTextColor;
-        thisMonthTextColor = dataForTopTable.thisMonthTextColor;
-        thisYearTextColor = dataForTopTable.thisYearTextColor;
-
-        dataForTopTable.dataTop.forEach(function (value) {
-            var productTotalSum = value.SumTotalPrice;
-            var revenueString = formatProfitForPrint(productTotalSum);
-            var valueTax = 0.0;
-            value.Products.forEach(function (item) {
-                valueTax += item.TotalTax;
-            });
-            var productTotalSumWithTax = productTotalSum + valueTax;
-            var revenueBruttoString = formatProfitForPrint(productTotalSumWithTax);
-            if (revenueString === '-') {
-                value.revenue = '-';
-            } else {
-                documentTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount);
-
-                var nettoHidedClass = self.currentUmsatz === 'netto' ? '' : ' hided-content';
-                var bruttoHidedClass = self.currentUmsatz === 'brutto' ? '' : ' hided-content';
-                value.revenue = '<div class="revenueLine' + nettoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueString + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span></div>' +
-                    '<div class="revenueLineBruttoUmsatz' + bruttoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueBruttoString + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span></div>';
-            }
-            // if (value.sourceDeliveryNotes != null && value.sourceDeliveryNotes != undefined && value.sourceDeliveryNotes.length > 0) {
-            //     value.sourceDeliveryNotes.forEach(function (note) {
-            //         self.deliveryNotes.models.forEach(function (noteCompany) {
-            //             if (noteCompany.attributes.DeliveryNoteNumber == note.DeliveryNoteNumber) {
-            //                 // note.DeliveryNoteNumber = note.DeliveryNoteNumber + " (" + noteCompany.attributes.Company + ")";
-            //             }
-            //         });
-            //     });
-            // }
-        });
-
-        this.processedData = data;
-        this.$el.html(this.template());
-
-        var showArrowsSummary;
-        if(typeof App.instance.thisUser.get('setting') !== 'undefined'){
-            showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-        }else{
-            showArrowsSummary = 'true';
-        }
-        //TODO refactor this fast fix bug with select of bootstrap-table
-        // if there are multiple tables and it hsva the sane field-names values of select's options increment both table's values
-
-        var newData = data.map(function (item) {
-            item.Status_invoices = item.FormattedStatus;
-            item.showArrowsSummary = showArrowsSummary;
-            item.deleted = false;
-            if (item.DeleteTimestamp !== '0000-00-00 00:00:00') {
-                var createDate = Date.parse(item.CreateTimestamp);
-                var deleteDate = Date.parse(item.DeleteTimestamp);
-                if (createDate < deleteDate) {
-                    item.deleted = true;
+                    App.instance.invoices.get(thisInvoice.get('Id'))
+                        .set({
+                            'sourceDeliveryNotes': sourceDeliveryNotes_clone,
+                            'DeliveryNotesStatusFormatted': field_deliveryNotesStatusFormatted
+                        });
                 }
             }
-            return item;
-        });
-        newData = $.grep(newData, function(item){
-            return item.deleted !== true;
+        }
+    },
+    getDeliveryNotesStatusFormattedField: function (sourceDeliveryNotes) {
+        let result = 'Finalisiert';
+        for (let i = 0; i < sourceDeliveryNotes.length; i++) {
+            if(sourceDeliveryNotes[i].FormattedStatus === 'Bearbeitung' || sourceDeliveryNotes[i].FormattedStatus === 'Storno')
+                result = sourceDeliveryNotes[i].FormattedStatus;
+            break;
+        }
+        return result;
+    },
+    setChanges: function (newData) {
+        let id = newData['Id'];
+
+        let index = this.findIndexCollection(this.filteredData, id);
+        if(index !== -1)
+            this.filteredData[index] = newData;
+
+        index = this.findIndexCollection(this.filteredDataSorted, id);
+        if(index !== -1)
+            this.filteredDataSorted[index] = newData;
+    },
+    applyChanges: function (Changes) {
+        let document_id = Changes.id;
+        let index_row = this.findIndexCollection(this.visibleData, document_id);
+        let available_fields = this.getFieldsAvailable(),
+            wasChangedCancelStatus = this.getWasChangedCancelStatus(Changes);
+
+        if (index_row !== -1) {
+            let wasChangedRevenue = false;
+            _.each(Changes.changed, (value, field) => {
+                if (available_fields.indexOf(field) !== -1) {
+                    let new_data = this.getNewData(Changes);
+                    this.renderTd(value, field, new_data, index_row);
+                }
+                wasChangedRevenue = !wasChangedRevenue ? this.getWasChangedRevenue(field, value) : true;
+            });
+            if (this.wasChangeMainNumber(Changes))
+                this.renderNumberColumn(index_row, 'InvoiceNumber');
+
+            if (wasChangedRevenue === true || wasChangedCancelStatus === true) {
+                if(wasChangedRevenue === true)
+                    this.reRenderTurnoverField(this.visibleData[index_row], index_row);
+
+                customDelay(() => {
+                    this.renderTopTableAfterFiltered();
+                }, 500);
+            }
+        }
+    },
+    removeDocumentRows: function (removed) {
+        let $rows;
+        let needReloadTable = false;
+        _.each(removed, (_document) => {
+            let document_id = _document.get('Id');
+            let row_index = this.getRowIndex(document_id);
+            if (row_index !== -1) {
+                let $row = this.getRow(row_index);
+                if ($rows === undefined)
+                    $rows = $row;
+                else $rows = $rows.add($row);
+            }
         });
 
-        if (sortOrderForTableINV() == 'desc') {
-            var reverseNewData = newData.slice().reverse();
-            this.paginationNewData = reverseNewData.slice(length - 30);
-        } else {
-            this.paginationNewData = newData.slice(length - 30);
+        if ($rows !== undefined)
+            this.deleteTableRows($rows);
+
+        this.lastVisibleIndex -= removed.length;
+        _.each(removed, (_document) => {
+            let document_id = _document.get('Id');
+            this.filteredDataSorted.splice(this.findIndexCollection(this.filteredDataSorted, document_id), 1);
+            this.visibleData.splice(this.findIndexCollection(this.visibleData, document_id), 1);
+        });
+
+        return needReloadTable;
+    },
+    setHandlerMouseover: function () {
+        return;
+    },
+    renderClusters: function (prev_last_index) {
+        return;
+    },
+    getPeriod: function () {
+        return App.instance.thisUser.getSetting('periodInvoiceList');
+    },
+    getTurnoverSetting: function () {
+        return App.instance.thisUser.getSetting('taxInvoiceList');
+    },
+    setSettingPeriods: function (period) {
+        App.instance.thisUser.setSetting('periodInvoiceList', period);
+        App.api.user.changeSetting.put('radio', 'periodInvoiceList', period);
+    },
+    setSettingSort: function (sortName, direction) {
+        App.instance.thisUser.setSetting('sortsInvoiceList_name', sortName);
+        App.api.user.changeSetting.put('radio', 'sortsInvoiceList_name', sortName);
+
+        App.instance.thisUser.setSetting('sortsInvoiceList_direct', direction);
+        App.api.user.changeSetting.put('radio', 'sortsInvoiceList_direct', direction);
+    },
+    setRevenues: function () {
+        this.invoices.forEach(Invoice => {
+            Invoice.set('revenue', this.getRevenue(Invoice), {silent: true})
+        });
+    },
+    getTable: function () {
+        return this.$el.find('#invoices-table');
+    },
+    hideParentElements: function () {
+        this.$parent_el.find('#invoices-header').add('#invoices-content').addClass('hidden');
+        this.$spinner.removeClass('hidden');
+    },
+    showParentElements: function () {
+        this.$parent_el.find('#invoices-header').add('#invoices-content').removeClass('hidden');
+    },
+    getFieldsInputAvailable: function () {
+        return [
+            'InvoiceNumber',
+            'OrderCreateTimestamp',
+            'CreateTimestamp',
+            'ModifyTimestamp',
+            'CompletedTimestamp',
+            'sourceDeliveryNotes'
+        ]
+    },
+    renderToolbarSetting: function () {
+        let $toolBar = this.getToolbar();
+
+        if (App.instance.thisUser.getSetting('deleteInvoiceWithDn') == 'true')
+            $toolBar.find('#deleteInvoiceWithDn').prop("checked", true);
+        else
+            $toolBar.find('#deleteInvoiceWithDn').prop("checked", false);
+
+        if (App.instance.thisUser.getSetting('showArrowsSummary') == 'false') {
+            this.$el.find('.arrowLineForTables i').css({'display': 'none'});
+            this.$el.find('.arrowLineForTables span').css({'margin-left': '0'});
         }
 
-        this.processedData = this.paginationNewData;
-        $deleteSelectedButton.prop('disabled', true);
+        this.$buttonPeriod = this.getButtonPeriod();
 
-        this.$el.find('#invoices-table').bootstrapTable({
-            data: this.paginationNewData,
-            toolbarAlign: 'none',
-            toolbar: '#toolbar-invoices-table', //Column order is important for custom toolbar
-            showColumns: true,
-            classes: 'table table-hover medium-font',
+        this.$buttonPeriod.html('<span>' + this.formatPeriodDE() + '</span> <span class="caret"></span>');
+        $toolBar.find('input[type = radio][name = period-document]').filter('[value = ' + this.currentPeriod + ']').prop('checked', true);
+
+        $toolBar.find('input[type = radio][name = turnover]').filter('[value = ' + this.moneyTurnover + ']').prop('checked', true);
+
+        this.$buttonTax = this.getButtonTax();
+        this.setTextButtonTax();
+
+        if (App.instance.thisUser.getSetting('InvoiceListShowColumn_OrderCreateTimestamp') == 'true')
+            $toolBar.find('input.add-column-menu#InvoiceListShowColumn_OrderCreateTimestamp').prop('checked', true);
+        if (App.instance.thisUser.getSetting('InvoiceListShowColumn_ModifyTimestamp') == 'true')
+            $toolBar.find('input.add-column-menu#InvoiceListShowColumn_ModifyTimestamp').prop('checked', true);
+        if (App.instance.thisUser.getSetting('InvoiceListShowColumn_CreateTimestamp') == 'true')
+            $toolBar.find('input.add-column-menu#InvoiceListShowColumn_CreateTimestamp').prop('checked', true);
+        if (App.instance.thisUser.getSetting('InvoiceListShowColumn_FormattedStatus') == 'true')
+            $toolBar.find('input.add-column-menu#InvoiceListShowColumn_FormattedStatus').prop('checked', true);
+        if (App.instance.thisUser.getSetting('InvoiceListShowColumn_paymentState') == 'true')
+            $toolBar.find('input.add-column-menu#InvoiceListShowColumn_paymentState').prop('checked', true);
+        if (App.instance.thisUser.getSetting('InvoiceListShowColumn_CompletedTimestamp') == 'true')
+            $toolBar.find('input.add-column-menu#InvoiceListShowColumn_CompletedTimestamp').prop('checked', true);
+        if (App.instance.thisUser.getSetting('InvoiceListShowColumn_sourceDeliveryNotes') == 'true')
+            $toolBar.find('input.add-column-menu#InvoiceListShowColumn_sourceDeliveryNotes').prop('checked', true);
+        if (App.instance.thisUser.getSetting('InvoiceListShowColumn_DeliveryNotesStatusFormatted') == 'true')
+            $toolBar.find('input.add-column-menu#InvoiceListShowColumn_DeliveryNotesStatusFormatted').prop('checked', true);
+        if (App.instance.thisUser.getSetting('InvoiceListShowColumn_revenue') == 'true')
+            $toolBar.find('input.add-column-menu#InvoiceListShowColumn_revenue').prop('checked', true);
+
+        this.$buttonRevenueParams = this.$el.find('#revenue-params-button');
+        this.setTextButtonRevenueParams();
+        let option_revenue_params = this.getOptionRevenueParams();
+        $toolBar.find('input[type = radio][name = invoices-revenue-params]').filter('[value = ' + option_revenue_params + ']').prop('checked', true);
+    },
+    disableMainButton: function () {
+        this.$buttonFinalize.add(this.$buttonDeleteSelected).add(this.$buttonPayment).prop('disabled', true);
+    },
+    setSelectOptionContraDocumentStatus: function (_document) {
+        if (_document.sourceDeliveryNotes !== null)
+            _.each(_document.sourceDeliveryNotes, deliveryNote => {
+                if (this.optionsStatusContraDocument.indexOf(deliveryNote.FormattedStatus) === -1)
+                    this.optionsStatusContraDocument.push(deliveryNote.FormattedStatus);
+            });
+    },
+    getFilteredData: function (documents) {
+        if (documents === undefined) {
+            if (this.notes.size == 0) {
+                documents = [];
+            } else {
+                documents = this.notes.toJSON();
+            }
+        }
+
+        let self = this;
+        let getTextHtmlField = function (field, _document) {
+            let formatter = self.getOptionColumn(field).formatter;
+            let html = formatter(_document[field], _document);
+
+            return $(html).text();
+        };
+        let getTextHtmlFieldSourceDNs = function (_document) {
+            let formatter = self.getOptionColumn('sourceDeliveryNotes').formatter;
+            let html = formatter(_document['sourceDeliveryNotes'], _document);
+
+            let result = [];
+            _.each($(html).find('a'), a => {
+                result.push($(a).text());
+            });
+            return result;
+        };
+        let filterFoo = function (_document) {
+            this.isEqStrings = (a, b) => {
+                return a.toLocaleLowerCase().indexOf(b.toLocaleLowerCase()) === 0;
+            };
+            let filterPeriod = () => {
+                let period;
+
+                switch (self.currentPeriod) {
+                    case 'today':
+                        period = moment().startOf('day');
+                        break;
+                    case 'yesterday':
+                        period = moment().startOf('day').subtract(1, 'day');
+                        break;
+                    case 'week':
+                        period = moment().day("Monday");
+                        break;
+                    case 'sevendays':
+                        period = moment().startOf('day').subtract(7, 'day');
+                        break;
+                    case 'month':
+                        period = moment().startOf('month');
+                        break;
+                    case 'year':
+                        period = moment().startOf('year');
+                        break;
+                }
+                if (period === undefined)
+                    return true;
+
+                let nameDateSorted = self.getDateNameSorted();
+                return moment(_document[nameDateSorted]) > period
+            };
+            let filterDocumentNumber = () => {
+                let filter = self.filter.InvoiceNumber;
+                if (filter === '')
+                    return true;
+                else if (_document['InvoiceNumber'] === null)
+                    return false;
+                let text = getTextHtmlField('InvoiceNumber', _document);
+                return this.isEqStrings(text, filter);
+            };
+            let dateCreated = () => {
+                let filter = self.filter.CreateTimestamp;
+                if (filter === '')
+                    return true;
+
+                let date = moment(_document['CreateTimestamp']).format('DD.MM.YYYY');
+
+                return self.checkBetweenDates(date, filter);
+            };
+            let dateOrderCreated = () => {
+                let filter = self.filter.OrderCreateTimestamp;
+                if (filter === '')
+                    return true;
+
+                let date = moment(_document['OrderCreateTimestamp']).format('DD.MM.YYYY');
+
+                return self.checkBetweenDates(date, filter);
+            };
+            let dateModify = () => {
+                let filter = self.filter.ModifyTimestamp;
+                if (filter === '')
+                    return true;
+
+                let date = moment(_document['ModifyTimestamp']).format('DD.MM.YYYY');
+
+                return self.checkBetweenDates(date, filter);
+            };
+            let dateFinalized = () => {
+                let filter = self.filter.CompletedTimestamp;
+                if (filter === '')
+                    return true;
+
+                let date = moment(_document['CompletedTimestamp']).format('DD.MM.YYYY');
+                return filter === date;
+            };
+            let documentStatus = () => {
+                let filter = self.filter.FormattedStatus;
+                if (filter === 'Alle')
+                    return true;
+
+                return filter === _document['FormattedStatus'];
+            };
+            let paymentState = () => {
+                let filter = self.filter.paymentState;
+                if (filter === 'Alle')
+                    return true;
+
+                return filter === _document['paymentState'];
+            };
+            let deliveryNoteNumber = () => {
+                let filter = self.filter.sourceDeliveryNotes;
+                if (filter === '')
+                    return true;
+                else if (_document['sourceDeliveryNotes'] === null)
+                    return false;
+
+                let text_arr = getTextHtmlFieldSourceDNs(_document);
+
+                let index = _.findIndex(text_arr,
+                    text => {
+                        return this.isEqStrings(text, filter);
+                    });
+                return index !== -1;
+            };
+            let deliveryNoteStatus = () => {
+                let filter = self.filter.DeliveryNotesStatusFormatted;
+                if (filter === 'Alle')
+                    return true;
+
+                let index = -1;
+                if (_document.sourceDeliveryNotes !== null) {
+                    index = _.findIndex(_document.sourceDeliveryNotes,
+                        deliveryNote => {
+                            return this.isEqStrings(deliveryNote.FormattedStatus, filter);
+                        });
+                }
+                return index !== -1;
+            };
+
+            return filterPeriod() &&
+                filterDocumentNumber() &&
+                dateOrderCreated() &&
+                dateCreated() &&
+                dateModify() &&
+                dateFinalized() &&
+                documentStatus() &&
+                paymentState() &&
+                deliveryNoteNumber() &&
+                deliveryNoteStatus();
+        };
+        let result = _.filter(documents, (_document) => {
+            return filterFoo(_document);
+        });
+
+        return result;
+    },
+    checkBetweenDates: function (date, filter) {
+        let dateFrom = filter.substr(0, filter.indexOf('-'));
+        dateFrom = dateFrom.substring(0, dateFrom.length - 1);
+        let dateTo = filter.substr(filter.indexOf('-'), filter.length);
+        dateTo = dateTo.substr(2);
+
+        var d1 = dateFrom.split(".");
+        var d2 = dateTo.split(".");
+        var c = date.split(".");
+
+        var from = new Date(d1[2], parseInt(d1[1])-1, d1[0]);
+        var to   = new Date(d2[2], parseInt(d2[1])-1, d2[0]);
+        var check = new Date(c[2], parseInt(c[1])-1, c[0]);
+
+        return check >= from && check <= to;
+    },
+    setData: function (noChangeLastVisibleIndex) {
+        this.setSorted();
+        this.visibleData = this.setVisibleData(undefined, noChangeLastVisibleIndex);
+    },
+    getSortName: function () {
+        return App.instance.thisUser.getSetting('sortsInvoiceList_name');
+    },
+    getSortDirection: function () {
+        return App.instance.thisUser.getSetting('sortsInvoiceList_direct');
+    },
+    setLastVisibleIndex: function () {
+        this.lastVisibleIndex =
+            this.filteredDataSorted.length > this.countOnPage ?
+                this.countOnPage * (this.pageNumber + 1) - 1 : this.filteredDataSorted.length - 1;
+    },
+    renderTable: function () {
+        let self = this;
+        let $table = this.getTable();
+        $table.bootstrapTable({
+            data: this.visibleData,
             filterControl: true,
-            paginationLoop: true,
-            sortName: sortNameForTableINV(),
-            sortOrder: sortOrderForTableINV(),
+            toolbarAlign: 'none',
+            sortable: false,
+            checkboxHeader: false,
             columns: [
                 {
                     formatter: indexFormatter,
                     class: 'position-column text-left wo-padding'
                 },
                 {
-                    field: 'state',
-                    checkbox: true,
-                    formatter: stateInvFormatter
+                    class: 'bst-checkbox',
+                    formatter: documentListCheckbox
                 },
                 {
                     field: 'InvoiceNumber',
-                    sortable: true,
-                    formatter: linkFormatter,
+                    formatter: InvoiceListLinkDocumentNumberFormatter,
                     title: 'Rechnungs Nr',
-                    filterControl: 'input',
-                    class: 'item-row',
-                    id: 'invInvoiceNumber'
+                    class: 'sortable item-row'
                 },
                 {
                     field: 'OrderCreateTimestamp',
-                    visible: visibleInvoicesColumnItemOrderCreateTimestamp(),
                     formatter: dateFormatter,
-                    filterControl: 'datepicker',
-                    filterDatepickerOptions: {
-                        format: 'dd.mm.yyyy',
-                        autoclose: true,
-                        clearBtn: true,
-                        todayHighlight: true
-                    },
-                    id: 'invOrderCreateTimestamp',
-                    class: 'table-th-datepicker-block',
-                    sortable: true,
-                    order: 'desc',
+                    class: 'table-th-datepicker-block sortable order-create-time',
                     title: 'Eingegangene <br/> Bestellung',
                     width: '115px'
                 },
                 {
                     field: 'CreateTimestamp',
-                    visible: visibleInvoicesColumnItemCreateTimestamp(),
-                    sortable: true,
-                    order: 'desc',
                     formatter: dateFormatter,
-                    filterControl: 'datepicker',
-                    filterDatepickerOptions: {
-                        format: 'dd.mm.yyyy',
-                        autoclose: true,
-                        clearBtn: true,
-                        todayHighlight: true
-                    },
-                    class: 'table-th-datepicker-block',
-                    id: 'invCreateTimestamp',
+                    class: 'table-th-datepicker-block sortable',
                     title: 'Erstellen <br/> Rechnung',
                     width: '115px'
                 },
                 {
                     field: 'ModifyTimestamp',
-                    visible: visibleInvoicesColumnItemModifyTimestamp(),
-                    order: 'desc',
-                    sortable: true,
                     formatter: dateFormatter,
-                    filterControl: 'datepicker',
-                    filterDatepickerOptions: {
-                        format: 'dd.mm.yyyy',
-                        autoclose: true,
-                        clearBtn: true,
-                        todayHighlight: true
-                    },
-                    id: 'invModifyTimestamp',
-                    class: 'table-th-datepicker-block',
+                    class: 'table-th-datepicker-block sortable',
                     title: 'Letzte <br/> Bearbeitung <br/> Rechnung',
                     width: '115px'
                 },
                 {
                     field: 'CompletedTimestamp',
-                    visible: visibleInvoicesColumnItemCompletedTimestamp(),
-                    order: 'desc',
-                    sortable: true,
-                    formatter: dateFormatterCompleted,
-                    filterControl: 'datepicker',
-                    filterDatepickerOptions: {
-                        format: 'dd.mm.yyyy',
-                        autoclose: true,
-                        clearBtn: true,
-                        todayHighlight: true
-                    },
-                    id: 'invCompletedTimestamp',
-                    class: 'table-th-datepicker-block',
+                    formatter: dateFormatter,
+                    class: 'table-th-datepicker-block sortable',
                     title: 'Finalisiert',
                     width: '115px'
                 },
                 {
-                    field: 'Status_invoices',
-                    id: 'notSorting',
-                    sortable: false,
-                    formatter: statusFormatter,
-                    filterControl: 'select',
-                    class: 'table-th-datepicker-block',
+                    field: 'FormattedStatus',
+                    formatter: documentStatusFormatter,
                     title: 'Status',
                     width: '120px'
                 },
                 {
+                    field: 'paymentState',
+                    formatter: formatterPaymentState,
+                    title: 'Zahlung',
+                    width: '120px'
+                },
+                {
                     field: 'sourceDeliveryNotes',
-                    sortable: true,
-                    order: 'desc',
                     formatter: sourceDeliveryNotesFormatter,
                     title: 'Erstellt aus Lieferschein Nr',
-                    class: 'item-row',
-                    id: 'invSourceDeliveryNotes',
+                    class: 'sortable item-row'
                 },
-                // {
-                //     field: 'DeliveryNotesNumberForStatus',
-                //     id: 'notSorting',
-                //     sortable: false,
-                //     formatter: secondStatusFormatter,
-                //     filterControl: 'select',
-                //     class: 'table-th-datepicker-block',
-                //     title: 'Status Rechnung',
-                //     width: '120px'
-                // },
+                {
+                    field: 'DeliveryNotesStatusFormatted',
+                    formatter: documentStatusFormatter,
+                    title: 'Status Lieferschein',
+                    width: '120px'
+                },
                 {
                     field: 'revenue',
-                    sortable: true,
-                    order: 'desc',
-                    title: 'Umsatz / % Marge / <br/> abs Marge',
-                    class: 'item-row',
-                    id: 'invRevenue'
+                    formatter: InvoicesGetRevenueFormatter,
+                    title: 'Umsatz / % Marge / <br/> absolut',
+                    class: 'sortable item-row'
                 }
             ],
             locale: 'de-DE',
-            onPostBody: function(rows){
-                var countDocuments;
-                if ($('#invoices-table')[0].rows[1].classList[0] == 'no-records-found') {
-                    countDocuments = 0;
-                } else {
-                    countDocuments = $('#invoices-table')[0].rows.length -1;
-                }
-                changeCountDocument(countDocuments, newData.length);
-                var Invoices = self.getAllSelectedInvoices();
-                changeCheckedDocument(Invoices.length);
-
-                if (periodForTableINV() != '#all-group'){
-                    self.processedData = self.invoices.toJSON();
-                }
-
-                if ($('#invoice-scroll-listener').get(0).scrollHeight == $('#invoice-scroll-listener').get(0).offsetHeight) {
-                    $makePageDown.attr('disabled', 'disabled');
-                    $makePageDown.addClass('arrowVisible');
-                    $makePageUp.attr('disabled', 'disabled');
-                    $makePageUp.addClass('arrowVisible');
-                }
-                if (countDocuments > 7) {
-                    $makePageDown.removeAttr('disabled');
-                    $makePageDown.removeClass('arrowVisible');
-                }
+            formatNoMatches: function () {
+                return "Keine passenden Ergebnisse gefunden.";
             },
-            onSort: function (name, order) {
-                var codeSetting = 'sortsForIN_' + name;
-                var target = 'sortsForIN_';
-                var value = order;
-                var elements = ['sortsForIN_CompletedTimestamp',
-                    'sortsForIN_CreateTimestamp',
-                    'sortsForIN_InvoiceNumber',
-                    'sortsForIN_ModifyTimestamp',
-                    'sortsForIN_OrderCreateTimestamp',
-                    'sortsForIN_revenue',
-                    'sortsForIN_sourceDeliveryNotes'];
-                var showArrowsSummary;
+            onPreBody: function () {
+                self.hiddenTable();
 
-                disabledElementForSlowConnection();
-
-                App.api.user.changeSetting.put(target, codeSetting, value).then(function (resp) {
-                    var setting_value = resp.toString();
-                    var settings = _.clone(App.instance.thisUser.get('setting'));
-
-                    _.map(elements, function(element) {
-                        if (element in settings) {
-                            return settings[element] = 'no';
-                        }
-                    });
-
-                    if (settings) {
-                        if (codeSetting in settings) {
-                            settings[codeSetting] = setting_value;
-                        }
-                    } else {
-                        settings = [];
-                        settings[codeSetting] = setting_value;
-                    }
-                    App.instance.thisUser.set('setting', settings);
-
-                    if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-                        showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-                        if (showArrowsSummary == 'false') {
-                            $('.arrowLineForTables span').css({'margin-left': '0'});
-                        }
-                    }
-                    includedElementForSlowConnection();
-                    self.renderTax();
-                });
+                self.removeExcessElements();
             },
-            onSearch: function () {
-                var dataForTopTable = self.recalculateTopTable($('#invoices-table').bootstrapTable('getData'));
+            onPostBody: function () {
+                self.changeCountsDocument();
+                self.changeCheckedDocument(0);
 
-                var todaySum = dataForTopTable.todaySum;
-                var todayMarAbs = dataForTopTable.todayMarAbs;
-                var todayMwst = dataForTopTable.todayMwst;
-                var thisWeekSum = dataForTopTable.thisWeekSum;
-                var thisWeekMarAbs = dataForTopTable.thisWeekMarAbs;
-                var thisWeekMwst = dataForTopTable.thisWeekMwst;
-                var thisMonthSum = dataForTopTable.thisMonthSum;
-                var thisMonthMarAbs = dataForTopTable.thisMonthMarAbs;
-                var thisMonthMwst = dataForTopTable.thisMonthMwst;
-                var thisYearSum = dataForTopTable.thisYearSum;
-                var thisYearMarAbs = dataForTopTable.thisYearMarAbs;
-                var thisYearMwst = dataForTopTable.thisYearMwst;
-                var documentTextColor = dataForTopTable.documentTextColor;
-                var todayTextColor = dataForTopTable.todayTextColor;
-                var thisWeekTextColor = dataForTopTable.thisWeekTextColor;
-                var thisMonthTextColor = dataForTopTable.thisMonthTextColor;
-                var thisYearTextColor = dataForTopTable.thisYearTextColor;
+                setTimeout(() => {
+                    self.renderLastClickedLink();
 
-                dataForTopTable.dataTop.forEach(function (value) {
-                    var productTotalSum = value.SumTotalPrice;
-                    var revenueString = formatProfitForPrint(productTotalSum);
-                    var valueTax = 0.0;
-                    value.Products.forEach(function (item) {
-                        valueTax += item.TotalTax;
-                    });
-                    var productTotalSumWithTax = productTotalSum + valueTax;
-                    var revenueBruttoString = formatProfitForPrint(productTotalSumWithTax);
-                    if (revenueString === '-') {
-                        value.revenue = '-';
-                    } else {
-                        documentTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount);
+                    self.tableRenderHelper();
 
-                        var nettoHidedClass = self.currentUmsatz === 'netto' ? '' : ' hided-content';
-                        var bruttoHidedClass = self.currentUmsatz === 'brutto' ? '' : ' hided-content';
-                        value.revenue = '<div class="revenueLine' + nettoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueString + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span></div>' +
-                            '<div class="revenueLineBruttoUmsatz' + bruttoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueBruttoString + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span></div>';
-                    }
-                    if (value.sourceDeliveryNotes != null && value.sourceDeliveryNotes != undefined && value.sourceDeliveryNotes.length > 0) {
-                        value.sourceDeliveryNotes.forEach(function (note) {
-                            self.deliveryNotes.models.forEach(function (noteCompany) {
-                                if (noteCompany.attributes.DeliveryNoteNumber == note.DeliveryNoteNumber) {
-                                    // note.DeliveryNoteNumber = note.DeliveryNoteNumber + " (" + noteCompany.attributes.Company + ")";
-                                }
-                            });
-                        });
-                    }
-                });
+                    self.renderHideColumn();
 
-                self.renderTopTable(todaySum, todayMarAbs, todayMwst, thisWeekSum, thisWeekMarAbs, thisWeekMwst, thisMonthSum, thisMonthMarAbs, thisMonthMwst,
-                    thisYearSum, thisYearMarAbs, thisYearMwst, documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor);
-
-                if (self.currentUmsatz === 'brutto') {
-                    var elementsToShow = document.getElementsByClassName('revenueLineBruttoUmsatz');
-                    var elementsToHide = document.getElementsByClassName('revenueLine');
-                    _.each(elementsToShow, function (row) {
-                        row.classList.remove("hided-content");
-                    });
-                    _.each(elementsToHide, function (row) {
-                        row.classList.add("hided-content");
-                    });
+                    self.setHandlers();
+                    self.showTable();
+                    self.changeNavigateButton();
+                }, 0);
+            }
+        });
+        var zahlungCheck = document.getElementById('InvoiceListShowColumn_paymentState');
+        zahlungCheck.addEventListener('change', (e) => {
+            var col1 = document.getElementById('InvoiceListShowColumn_sourceDeliveryNotes');
+            var col2 = document.getElementById('InvoiceListShowColumn_DeliveryNotesStatusFormatted');
+            if (e.target.checked) {
+                if (col1.checked === true) {
+                    $(col1).trigger('click');
                 }
-            },
-            onCheckAll: function (rows) {
-                if (rows.length > 0) {
-                    $deleteSelectedButton.prop('disabled', false);
-
-                    var Invoices = self.getAllSelectedInvoices();
-                    changeCheckedDocument(Invoices.length);
+                if (col2.checked === true) {
+                    $(col2).trigger('click');
                 }
-            },
-            onUncheckAll: function () {
-                $deleteSelectedButton.prop('disabled', true);
-
-                var Invoices = self.getAllSelectedInvoices();
-                changeCheckedDocument(Invoices.length);
-            },
-            onCheck: function (row) {
-                $deleteSelectedButton.prop('disabled', false);
-
-                var selected_Invoices = self.getAllSelectedInvoices();
-
-                changeCheckedDocument(selected_Invoices.length);
-
-                if (selected_Invoices.length > 0) {
-                    $deleteSelectedButton.prop('disabled', false);
+            } else {
+                if (col1.checked === false) {
+                    $(col1).trigger('click');
                 }
-            },
-            onUncheck: function (row) {
-                var selected_Invoices = self.getAllSelectedInvoices();
-                changeCheckedDocument(selected_Invoices.length);
-                $deleteSelectedButton.prop('disabled', false);
-
-                if (selected_Invoices.length === 0) {
-                    $deleteSelectedButton.prop('disabled', true);
+                if (col2.checked === false) {
+                    $(col2).trigger('click');
                 }
             }
         });
-        $deleteSelectedButton.off('click').on('click', function () {
-            var text = 'Ausgewählte Rechnungen löschen?';
-            Matrex.confirm(text, function () {
-                disabledElementForSlowConnection();
-                var Invoices = self.getAllSelectedInvoices();
-                var delDelivNotes = document.getElementById('delete-with-delivery-note').checked;
-                var InvId = Invoices.map(function (item) {
-                    return item.Id
-                });
-                var Dns = Invoices.map(function (item) {
-                    return item.sourceDeliveryNotes
-                });
-                var DnId = [];
-                _.each(Dns, function (dn) {
-                    _.each(dn, function (dnid) {
-                        DnId.push(dnid.Id);
+    },
+    renderRevenueHeader: function () {
+        let text = this.getOptionRevenueParams() === 'marge' ? 'Umsatz / % Marge / <br> absolut' : 'Umsatz / A (7%) /<br>B (19%) / MwSt. Summ';
+        this.getTable().find('th[data-field="revenue"] div.th-inner').html(text);
+    },
+    tableRenderHelper: function () {
+        this.renderRevenueHeader();
+        this.drawSorts();
+        this.renderFilter();
+    },
+    wasDeleteDN: function () {
+        return App.instance.thisUser.getSetting('deleteInvoiceWithDn') === 'true';
+    },
+    isChangingDataBackendDelete: function () {
+        return this.wasRenameDeletedDocuments();
+    },
+    fetchDNs: function (ids) {
+        _.each(ids, id => {
+            let Dn = this.notes.get(id);
+            if (Dn !== undefined)
+                Dn.fetch();
+        });
+    },
+    removeDocumentsCollection: function (removed_ids) {
+        if (!this.isEqualCollections()) {
+            App.instance.invoices.remove(removed_ids);
+            this.invoices.remove(removed_ids);
+        } else this.invoices.remove(removed_ids);
+    },
+    deleteDocuments: function () {
+        let self = this;
+        let text = 'Ausgewählte Rechnungen löschen?';
+        Matrex.confirm(text, function () {
+            let invoices = self.getAllSelectedDocuments();
+            let ids = _.pluck(invoices, 'Id');
+
+            let dnIds = [];
+            _.each(invoices, (invoice) => {
+                if (invoice.sourceDeliveryNotes !== null)
+                    _.each(invoice.sourceDeliveryNotes, dn => {
+                        if(dnIds.indexOf(dn.Id) === -1)
+                            dnIds.push(dn.Id);
                     });
-                });
-                App.instance.invoices.fetch({
-                    type: 'DELETE',
-                    reset: true,
-                    data: {
-                        InvoicesIds: InvId,
-                        DeleteDeliveryNotes: delDelivNotes,
-                        DeliveryNotesToDelete: DnId
+            });
+
+            if (!self.isChangingDataBackendDelete()) {
+                App.api.document.invoice.delete_not_rename(ids).then(
+                    () => {
+                        self.fetchDNs(dnIds);
+                    }
+                );
+                self.removeDocumentsCollection(ids);
+            } else {
+                self.disabledForm();
+                App.api.document.invoice.deleteFetch(ids).then(
+                    (all_documents) => {
+                        self.setCollectionsAfterFetch(all_documents);
+
+                        if(self.wasDeleteDN())
+                            self.notes.remove(dnIds);
+                        else self.setDeletedInvoicesDns(dnIds);
+                        self.enabledForm();
                     },
-                    success: function () {
-                        var invoicesData = self.invoices.models.map(function (item) {
-                            item.attributes.deleted = false;
-                            if (item.attributes.DeleteTimestamp !== '0000-00-00 00:00:00') {
-                                var createDate = Date.parse(item.attributes.CreateTimestamp);
-                                var deleteDate = Date.parse(item.attributes.DeleteTimestamp);
-                                if (createDate < deleteDate) {
-                                    item.attributes.deleted = true;
-                                }
-                            }
-                            return item;
-                        });
-                        invoicesData = $.grep(invoicesData, function(item){
-                            return item.attributes.deleted !== true;
-                        });
-                        self.invoices.models = invoicesData;
-                        self.processedData = self.invoices.toJSON();
-                        self.render();
-                        setTimeout(function () {
-                            self.addRowsOnScroll(100);
-                        }, 1000);
-                        App.instance.deliveryNotes.fetch({
-                            reset: true,
-                            error: function (model, response, options) {
-                                displayErrorBackbone(model, response, options);
-                            },
-                            success: function () {
-                                App.instance.deliveryNotes.forEach(function (value) {
-                                    if (value.attributes.InvoiceId != null) {
-                                        if (InvId.includes(value.attributes.InvoiceId)) {
-                                            value.attributes.InvoiceId = null;
-                                            value.attributes.InvoiceNumber = null;
-                                            value.attributes.InvoiceNumberForStatus = null;
-                                            value.attributes.InvoiceStatus = null;
-                                            value.attributes.InvoiceTitle = null;
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                        includedElementForSlowConnection();
-                        Matrex.notify('Rechnungen wurden entfernt.', 'success');
-                        self.$el.find('#invoices-table').bootstrapTable('uncheckAll');
-                    },
-                    error: function (model, response, options) {
-                        includedElementForSlowConnection();
-                        Matrex.notify(response.responseJSON.message, 'error');
+                    () => {
+                        self.enabledForm();
                     }
-                })
-            }, function () {
-            });
-        });
-
-        var scHeight = $('#invoice-scroll-listener').get(0).scrollHeight;
-        var clHeight = $('#invoice-scroll-listener').get(0).clientHeight;
-        var scTop = $('#invoice-scroll-listener').scrollTop();
-        $('html').keydown(function(e){
-            scHeight = $('#invoice-scroll-listener').get(0).scrollHeight;
-            clHeight = $('#invoice-scroll-listener').get(0).clientHeight;
-            scTop = $('#invoice-scroll-listener').scrollTop();
-
-            if (e.which == 40 || e.which == 98) {
-                $makePageUp.removeAttr('disabled');
-                $makePageUp.removeClass('arrowVisible');
-
-                $('#invoice-scroll-listener').scrollTop(scTop + clHeight);
-
-                if (scHeight <= clHeight + scTop) {
-                    $makePageDown.attr('disabled', 'disabled');
-                    $makePageDown.addClass('arrowVisible');
-                }
+                );
             }
-            if (e.which == 38 || e.which == 104) {
-                $makePageDown.removeAttr('disabled');
-                $makePageDown.removeClass('arrowVisible');
+        }, function () {
+        });
+    },
+    setDeletedInvoicesDns: function (dn_ids) {
+        _.each(dn_ids, id => {
+            let Model = this.notes.get(id);
+            if(Model !== undefined)
+                Model.set({
+                    InvoiceId: null,
+                    InvoiceNumber: null,
+                    InvoiceStatusFormatted: null,
+                    InvoiceTitle: null,
+                    InvoiceVersion: ""
+                });
+        });
+    },
+    downloadPdf: function () {
+        var selected_INVs = this.getAllSelectedDocuments();
+        var arrIds = [];
 
-                $('#invoice-scroll-listener').scrollTop(scTop - clHeight);
+        _.each(selected_INVs, (selected_INV) => {
+            arrIds.push(selected_INV.Id);
+        });
 
-                if ($('#invoice-scroll-listener').scrollTop() == 0) {
-                    $makePageUp.attr('disabled', 'disabled');
-                    $makePageUp.addClass('arrowVisible');
-                }
+        var url = getApiUrl() + '/download/pdfs/' + App.instance.thisUser.getSellerSuper() + '/invoice/' + arrIds.join('-')  + '?format=zip';
+        var pdf = window.open(url, '_system');
+
+        Matrex.notify('Dateien erfolgreich zum download gesendet.', 'success');
+    },
+    finalizeDocuments: function () {
+        let documents = this.getAllSelectedDocuments();
+        let ids = [];
+        _.each(documents, function (document) {
+            if (document.CompletedTimestamp === "0000-00-00 00:00:00")
+                ids.push(document.Id);
+        });
+
+        if (ids.length == 0) {
+            Matrex.notify('Nichts zu finalisieren', 'warning');
+            return false;
+        }
+        this.disabledForm();
+        App.api.document.invoice.finalize(ids).then(
+            (documents) => {
+                this.enabledForm();
+                this.setDocumentsCollection(documents);
+
+                _.each(documents, invoice => {
+                    let InvoiceModel = App.instance.invoices.get(invoice['Id']);
+                    if(InvoiceModel !== undefined)
+                        App.instance.deliveryNotes.changeDocumentCollection(InvoiceModel.getDnIds());
+                });
+
+                this.renderParentButtonsStatus();
+                Matrex.notify('Die Rechnung wurde abgeschlossen.', 'success');
+            },
+            (model, response, options) => {
+                this.enabledForm();
+                displayErrorBackbone(model, response, options);
             }
+        );
+    },
+    setHandlers: function () {
+        this.setHandlersCommonToolbar();
+        this.setHandlersCommonTable();
+        this.setHandlersCommonParent();
+        this.setHandlersCommonButtons();
+        this.setHandlersCommonRows();
+
+        this.getToolbar().find('#deleteInvoiceWithDn').off('change').on('change', (e) => {
+            this.changeCheckboxSetting(e);
         });
 
-        $('#open-delivery-notes').one('click', function () {
-            var headerTemplate = _.template($('#company-address-tpl').html());
-            $('#delivery-notes-header').empty();
-            $('#delivery-notes-header').html(headerTemplate(
-                _.extend({
-                    companyName: 'Alle Kunden',
-                    address: '',
-                })
-            ));
-            formatCommaText($('#delivery-notes-header'))
-            var item = new CustomerDeliveryNotesView(self.deliveryNotes, self.invoices, 0);
-            item.render();
-            setTimeout(function () {
-                item.addRowsOnScroll(100);
-            }, 1000);
+        this.getToolbar().find('input[name="invoices-revenue-params"]').off('change').on('change', (e) => {
+            this.changeRevenueParams(e);
+        });
+        this.$buttonPayment.off('click').on('click', () => {
+            this.paymentOpen();
         });
 
-        $makePageDown.on('click', function (e) {
-            scHeight = $('#invoice-scroll-listener').get(0).scrollHeight;
-            clHeight = $('#invoice-scroll-listener').get(0).clientHeight;
-            scTop = $('#invoice-scroll-listener').scrollTop();
-
-            $makePageUp.removeAttr('disabled');
-            $makePageUp.removeClass('arrowVisible');
-
-            $('#invoice-scroll-listener').scrollTop(scTop + clHeight);
-
-            if (scHeight <= clHeight + scTop) {
-                $makePageDown.attr('disabled', 'disabled');
-                $makePageDown.addClass('arrowVisible');
-            }
+        this.$buttonDownloadPdf.off('click').on('click', () => {
+            this.downloadPdf();
         });
-        $makePageUp.on('click', function (e) {
-            scHeight = $('#invoice-scroll-listener').get(0).scrollHeight;
-            clHeight = $('#invoice-scroll-listener').get(0).clientHeight;
-            scTop = $('#invoice-scroll-listener').scrollTop();
+    },
+    paymentOpen: function () {
+        let _document = this.getAllSelectedDocuments();
+        if (_document.length === 1) {
+            this.disableNavigationHandler();
+            let PaymentModal = new PaymentInvoiceView(_document[0]);
+            PaymentModal.off('hidden.bs.modal').on('hidden.bs.modal', ()=>{this.setHandlersCommonParent()});
+        }
+    },
+    disableNavigationHandler: function () {
+        $('body').off('keyup');
+        $('body').off('keydown');
+    },
+    getOptionRevenueParams: function () {
+        return App.instance.thisUser.getSetting('invoicesRevenueParams');
+    },
+    setTextButtonRevenueParams: function () {
+        let option = this.getOptionRevenueParams();
+        let text = (option === 'marge') ? ' Marge' : 'MwSt.';
 
-            $makePageDown.removeAttr('disabled');
-            $makePageDown.removeClass('arrowVisible');
+        this.$buttonRevenueParams.find('span:first-child').text(text);
+    },
+    changeRevenueParams: function (e) {
+        let value = $(e.target).val();
 
-            $('#invoice-scroll-listener').scrollTop(scTop - clHeight);
+        App.instance.thisUser.setSetting('invoicesRevenueParams', value);
+        App.api.user.changeSetting.put('radio', 'invoicesRevenueParams', value);
 
-            if ($('#invoice-scroll-listener').scrollTop() == 0) {
-                $makePageUp.attr('disabled', 'disabled');
-                $makePageUp.addClass('arrowVisible');
-            }
-        });
+        this.setTextButtonRevenueParams();
 
-        this.renderTopTable(todaySum, todayMarAbs, todayMwst, thisWeekSum, thisWeekMarAbs, thisWeekMwst, thisMonthSum, thisMonthMarAbs, thisMonthMwst,
-            thisYearSum, thisYearMarAbs, thisYearMwst, documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor);
+        this.reloadTable();
+    },
+    openContraTable: function () {
+        if (this.customerId === 0)
+            App.instance.customerFilterBarView.allDeliveryNotes();
+        else {
+            let deliveryNotes = new DeliveryNotes();
+            deliveryNotes.reset(this.notes.where({CustomerId: this.customerId}));
 
-        this.tableSwitchFilterHelper(self.$el);
-        var civ = this;
-        var periodButton = this.$el.find('#date-group-dropdown-invoice');
+            let Customer = App.instance.customers.find(Customer => {
+                return Customer.get('Id') === this.customerId;
+            });
+            let tempView = new CustomerListItemView(
+                Customer.toJSON(),
+                undefined,
+                deliveryNotes
+            );
+            setTimeout(() => {
+                tempView.showDeliveryNotes();}, 0);
+        }
+    },
+    setDefaultTitleButtons: function () {
+        let title_deleteSelectedButton = "Löschen",
+            title_FinalizeButton = "Rechnung finalisieren",
+            title_paymentButton = "Bezahlung",
+            title_downloadPdfs = "Pdf herunterladen";
 
-        if (periodForTableINV() == '#today-group'){
-            $('#today-group').attr('checked', 'checked');
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var today = new Date();
-            today.setHours(0, 0, 0, 0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > today) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            periodButton[0].innerHTML = '<span>Heute</span> <span class="caret"></span>';
-        } else if (periodForTableINV() == '#yesterday-group'){
-            $('#yesterday-group').attr('checked', 'checked');
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var yesterdate = new Date();
-            yesterdate.setDate(yesterdate.getDate() - 1);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > yesterdate) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            periodButton[0].innerHTML = '<span>Gestern</span> <span class="caret"></span>';
-        } else if (periodForTableINV() == '#week-group'){
-            $('#week-group').attr('checked', 'checked');
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var thisWeek = new Date();
-            thisWeek.setHours(0, 0, 0, 0);
-            var day = thisWeek.getDay();
-            var diff = thisWeek.getDate() - day + (day == 0 ? -6 : 1);
-            thisWeek = new Date(thisWeek.setDate(diff));
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > thisWeek) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            periodButton[0].innerHTML = '<span>Diese Woche</span> <span class="caret"></span>';
-        } else if (periodForTableINV() == '#sevendays-group'){
-            $('#sevendays-group').attr('checked', 'checked');
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var sevendays = new Date();
-            sevendays.setDate(sevendays.getDate() - 7);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > sevendays) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            periodButton[0].innerHTML = '<span>Letzte Woche</span> <span class="caret"></span>';
-        } else if (periodForTableINV() == '#month-group'){
-            $('#month-group').attr('checked', 'checked');
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var thisMonth = new Date();
-            thisMonth = new Date(thisMonth.getFullYear(), thisMonth.getMonth(), 1);
-            thisMonth.setHours(0, 0, 0, 0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > thisMonth) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            periodButton[0].innerHTML = '<span>Dieser Monat</span> <span class="caret"></span>';
-        } else if (periodForTableINV() == '#year-group'){
-            $('#year-group').attr('checked', 'checked');
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var thisYear = new Date(new Date().getFullYear(), 0, 1);
-            thisYear.setHours(0, 0, 0, 0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > thisYear) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            periodButton[0].innerHTML = '<span>Dieses Jahr</span> <span class="caret"></span>';
-        } else if (periodForTableINV() == '#all-group'){
-            $('#all-group').attr('checked', 'checked');
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', civ.processedData);
-            periodButton[0].innerHTML = '<span>Alle Rechnunge</span> <span class="caret"></span>';
+        this.$buttonDownloadPdf.attr('title', title_downloadPdfs);
+        this.$buttonPayment.attr('title', title_paymentButton);
+        this.$buttonFinalize.attr('title', title_FinalizeButton);
+        this.$buttonDeleteSelected.attr('title', title_deleteSelectedButton);
+    },
+    getCountAllData: function () {
+        return this.filteredDataSorted.length;
+    },
+    renderParentButtonsStatus: function () {
+        clearTimeout(this.timerRenderParentButtonsStatus);
+        this.timerRenderParentButtonsStatus = setTimeout(
+            () => {
+                let selected_Invoices = this.getAllSelectedDocuments();
+                this.changeCheckedDocument(selected_Invoices.length);
+
+                let _arguments = this.initializeAngumentChangedButton(selected_Invoices.length);
+
+                _.each(selected_Invoices, (invoice) => {
+                    _arguments = this.getArgumentChangedButton(invoice, _arguments);
+                });
+                this.changeDisableButton(_arguments);
+                this.changeTitleFooterButtons(_arguments);
+            }, 200
+        );
+    },
+    changeDisableButton: function (_arguments) {
+        if (_arguments !== undefined && _arguments.countDocument > 0) {
+            this.$buttonDeleteSelected.prop('disabled', false);
+            this.$buttonFinalize.prop('disabled', (_arguments.allFinalizedCanceled === true || _arguments.emptyProducts));
+            this.$buttonPayment.prop('disabled', !(_arguments.countDocument === 1 && _arguments.hasFinalized === true));
+            this.$buttonDownloadPdf.prop('disabled', !this.isAllSelectedDocumentFinalized(_arguments))
         } else {
-            $('#all-group').attr('checked', 'checked');
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', civ.processedData);
-            periodButton[0].innerHTML = '<span>Alle Rechnunge</span> <span class="caret"></span>';
+            this.$buttonDeleteSelected.prop('disabled', true);
+            this.$buttonFinalize.prop('disabled', true);
+            this.$buttonPayment.prop('disabled', true);
+            this.$buttonDownloadPdf.prop('disabled', true);
+        }
+    },
+    changeTitleFooterButtons: function (_arguments) {
+        let empty_document_title = "Keine produkte",
+            allFinalized_title = "All Finalized",
+            notFinalized = "Nicht Finalized",
+            moreThatOne = "Mehr als Eine",
+            canceled_title = "Storno",
+            notAllFinalised = "Nicht alles finalized";
+
+        this.setDefaultTitleButtons();
+
+        if(!this.isAllSelectedDocumentFinalized(_arguments)) {
+            let title_downloadPdfs = this.$buttonDownloadPdf.attr('title');
+            this.$buttonDownloadPdf.attr('title', title_downloadPdfs + " " + notAllFinalised);
         }
 
-        $('#today-group').off().on('click', function (e) {
-            rollCallIN(e);
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var today = new Date();
-            today.setHours(0, 0, 0, 0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > today) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            civ.changePeriodSetting(e);
-            periodButton[0].innerHTML = '<span>Heute</span> <span class="caret"></span>';
-        });
-        $('#yesterday-group').off().on('click', function (e) {
-            rollCallIN(e);
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var yesterdate = new Date();
-            yesterdate.setDate(yesterdate.getDate() - 1);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > yesterdate) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            civ.changePeriodSetting(e);
-            periodButton[0].innerHTML = '<span>Gestern</span> <span class="caret"></span>';
-        });
-        $('#week-group').off().on('click', function (e) {
-            rollCallIN(e);
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var thisWeek = new Date();
-            thisWeek.setHours(0, 0, 0, 0);
-            var day = thisWeek.getDay();
-            var diff = thisWeek.getDate() - day + (day == 0 ? -6 : 1);
-            thisWeek = new Date(thisWeek.setDate(diff));
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > thisWeek) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            civ.changePeriodSetting(e);
-            periodButton[0].innerHTML = '<span>Diese Woche</span> <span class="caret"></span>';
-        });
-        $('#sevendays-group').off().on('click', function (e) {
-            rollCallIN(e);
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var sevendays = new Date();
-            sevendays.setDate(sevendays.getDate() - 7);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > sevendays) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            civ.changePeriodSetting(e);
-            periodButton[0].innerHTML = '<span>Letzte Woche</span> <span class="caret"></span>';
-        });
-        $('#month-group').off().on('click', function (e) {
-            rollCallIN(e);
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var thisMonth = new Date();
-            thisMonth = new Date(thisMonth.getFullYear(), thisMonth.getMonth(), 1);
-            thisMonth.setHours(0, 0, 0, 0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > thisMonth) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            civ.changePeriodSetting(e);
-            periodButton[0].innerHTML = '<span>Dieser Monat</span> <span class="caret"></span>';
-        });
-        $('#year-group').off().on('click', function (e) {
-            rollCallIN(e);
-            var existingData = civ.processedData;
-            var filteredData = [];
-            var thisYear = new Date(new Date().getFullYear(), 0, 1);
-            thisYear.setHours(0, 0, 0, 0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > thisYear) {
-                    filteredData.push(value);
-                }
-            });
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', filteredData);
-            civ.changePeriodSetting(e);
-            periodButton[0].innerHTML = '<span>Dieses Jahr</span> <span class="caret"></span>';
+        if (_arguments.allFinalizedCanceled && _arguments.hasFinalized) {
+            let title_Finalized = this.$buttonFinalize.attr('title');
+            this.$buttonFinalize.attr('title', title_Finalized + " " + allFinalized_title);
+        }
 
-        });
-        $('#all-group').off().on('click', function (e) {
-            rollCallIN(e);
-            var $table = $('#invoices-table');
-            $table.bootstrapTable('load', civ.processedData);
-            civ.changePeriodSetting(e);
-            periodButton[0].innerHTML = '<span>Alle Rechnungen</span> <span class="caret"></span>';
-
-        });
-        $('#invoices-table .sortable').off().on('click', function () {
-            var $table = $('#invoices-table');
-            civ.processedData = data;
-            $table.bootstrapTable('load', civ.processedData);
-        });
-
-        civ.renderTax();
-        if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-            showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-            if (showArrowsSummary == 'false') {
-                $('.arrowLineForTables i').css({'display': 'none'});
-                $('.arrowLineForTables span').css({'margin-left': '0'});
+        if(_arguments.countDocument === 1) {
+            if( ! _arguments.hasFinalized) {
+                let title_Payment = this.$buttonPayment.attr('title');
+                this.$buttonPayment.attr('title', title_Payment + " " + notFinalized);
             }
+            if(_arguments.hasCanceled) {
+                let title_Finalize = this.$buttonFinalize.attr('title');
+                this.$buttonFinalize.attr('title', title_Finalize + " " + canceled_title);
+            }
+        } else if(_arguments.countDocument > 1) {
+            let title_Payment = this.$buttonPayment.attr('title');
+            this.$buttonPayment.attr('title', title_Payment + " " + moreThatOne);
         }
+
+        if (_arguments.emptyProducts) {
+            let title_allFinalized = this.$buttonFinalize.attr('title');
+            this.$buttonFinalize.attr('title', title_allFinalized + " " + empty_document_title);
+        }
+    },
+    getArgumentChangedButton: function (selected_Invoices, _arguments) {
+        let result = _arguments;
+        result.allFinalizedCanceled = this.getAllFinalizedCanceled(_arguments, selected_Invoices.Status);
+        result.hasCanceled = result.hasCanceled ? result.hasCanceled : selected_Invoices.Status === 'Canceled';
+        result.hasFinalized = result.hasFinalized ? result.hasFinalized : selected_Invoices.Status === 'Completed';
+
+        if (selected_Invoices.Products.length === 0)
+            result.emptyProducts = true;
+
+        return result;
+    },
+    initializeAngumentChangedButton: function (countDocument) {
+        return {
+            countDocument: countDocument,
+            emptyProducts: false,
+            hasFinalized: false,
+            hasCanceled: false,
+            allFinalizedCanceled: null
+        };
+    },
+    checkAll: function () {
+        let checkboxs = this.getCheckbox();
+        let emptyProducts = false,
+            allFinalized = null;
+
+        let _arguments = this.initializeAngumentChangedButton(checkboxs.length);
+        if (checkboxs.length > 0) {
+            this.changeCheckedDocument(checkboxs.length);
+
+            _.each(checkboxs, (checkbox) => {
+                let $checkbox = $(checkbox);
+                $checkbox.prop('checked', true);
+
+                let _document = this.getVisibleDocument(this.getDataIndexCheckbox(checkbox));
+            });
+        }
+        this.changeDisableButton(_arguments);
+        this.changeTitleFooterButtons(_arguments);
+    },
+    uncheckAll: function () {
+        let checkboxs = this.getCheckedCheckbox();
+        _.each(checkboxs, (checkbox) => {
+            $(checkbox).prop('checked', false);
+        });
+        this.changeCheckedDocument(0);
+        this.changeDisableButton();
+        this.setDefaultTitleButtons();
+    },
+    render: function () {
+        this.$el.html(this.template());
+        this.hideParentElements();
+        setTimeout(() => {
+            this.renderToolbarSetting();
+            this.disableMainButton();
+            this.renderMainButton();
+            this.setDefaultTitleButtons();
+            this.showParentElements();
+            this.setAllData();
+            this.renderTopTableAfterFiltered();
+            this.renderTable();
+        }, 0);
+
         return this;
     },
-    renderTax: function() {
-        if (taxForTableInv() == '#umsatz-netto-radio'){
-            $('#umsatz-netto-radio-inv').attr('checked', 'checked');
-            $('#tax-button')[0].innerHTML = '<span>Netto</span> <span class="caret"></span>';
-            this.currentUmsatz = 'netto';
-            var elementsToShow = document.getElementsByClassName('revenueLine');
-            var elementsToHide = document.getElementsByClassName('revenueLineBruttoUmsatz');
-            _.each(elementsToShow, function (row) {
-                row.classList.remove("hided-content");
-            });
-            _.each(elementsToHide, function (row) {
-                row.classList.add("hided-content");
-            });
-        } else if (taxForTableInv() == '#umsatz-brutto-radio') {
-            $('#umsatz-brutto-radio-inv').attr('checked', 'checked');
-            $('#tax-button')[0].innerHTML = '<span>Brutto</span> <span class="caret"></span>';
-            this.currentUmsatz = 'brutto';
-            var elementsToShow = document.getElementsByClassName('revenueLineBruttoUmsatz');
-            var elementsToHide = document.getElementsByClassName('revenueLine');
-            _.each(elementsToShow, function (row) {
-                row.classList.remove("hided-content");
-            });
-            _.each(elementsToHide, function (row) {
-                row.classList.add("hided-content");
-            });
-        }
+    getDateNameSorted: function (sortName) {
+        let availableColumns = ['OrderCreateTimestamp', 'CreateTimestamp', 'ModifyTimestamp', 'CompletedTimestamp'];
+        if (sortName === undefined)
+            sortName = this.getSortName();
+
+        let result = availableColumns.indexOf(sortName) !== -1 ? sortName : 'CreateTimestamp';
+
+        return result;
     },
-    renderTopTable: function (todaySum, todayMarAbs, todayMwst, thisWeekSum, thisWeekMarAbs, thisWeekMwst, thisMonthSum, thisMonthMarAbs, thisMonthMwst,
-                              thisYearSum, thisYearMarAbs, thisYearMwst, documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor) {
-        var element = $('#iTodaySum');
-        element[0].innerHTML = '\u20AC ' + formatOtherMoneyForPrint(todaySum);
-        element.addClass(todayTextColor);
-
-        element = $('#iThisWeekSum');
-        element[0].innerHTML = '\u20AC ' + formatOtherMoneyForPrint(thisWeekSum);
-        element.addClass(thisWeekTextColor);
-
-        element = $('#iThisMonthSum');
-        element[0].innerHTML = '\u20AC ' + formatOtherMoneyForPrint(thisMonthSum);
-        element.addClass(thisMonthTextColor);
-
-        element = $('#iThisYearSum');
-        element[0].innerHTML = '\u20AC ' + formatOtherMoneyForPrint(thisYearSum);
-        element.addClass(thisYearTextColor);
-
-        element = $('#iTodayMar');
-        if (todayMarAbs != 0) {
-            element[0].innerHTML = '% ' + formatProfitForPrint((todayMarAbs/todaySum) * 100) +
-                ' / \u20AC ' + formatProfitForPrint(todayMarAbs);
-        } else {
-            element[0].innerHTML = '% -  / \u20AC -';
-        }
-        element.addClass(todayTextColor);
-
-        element = $('#iThisWeekMar');
-        if (thisWeekMarAbs != 0) {
-            element[0].innerHTML = '% ' + formatProfitForPrint((thisWeekMarAbs/thisWeekSum)*100) +
-                ' / \u20AC ' + formatProfitForPrint(thisWeekMarAbs);
-        } else {
-            element[0].innerHTML = '% -  / \u20AC -';
-        }
-        element.addClass(thisWeekTextColor);
-
-        element = $('#iThisMonthMar');
-        if (thisMonthMarAbs != 0) {
-            element[0].innerHTML = '% ' + formatProfitForPrint((thisMonthMarAbs/thisMonthSum)*100) +
-                ' / \u20AC ' + formatProfitForPrint(thisMonthMarAbs);
-        } else {
-            element[0].innerHTML = '% -  / \u20AC -';
-        }
-        element.addClass(thisMonthTextColor);
-
-        element = $('#iThisYearMar');
-        if (thisYearMarAbs != 0) {
-            element[0].innerHTML = '% ' + formatProfitForPrint((thisYearMarAbs/thisYearSum)*100) +
-                ' / \u20AC ' + formatProfitForPrint(thisYearMarAbs);
-        } else {
-            element[0].innerHTML = '% -  / \u20AC -';
-        }
-        element.addClass(thisYearTextColor);
-
-        element = $('#iTodayArt');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(todayMwst);
-        element.addClass(todayTextColor);
-
-        element = $('#iThisWeekArt');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisWeekMwst);
-        element.addClass(thisWeekTextColor);
-
-        element = $('#iThisMonthArt');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisMonthMwst);
-        element.addClass(thisMonthTextColor);
-
-        element = $('#iThisYearArt');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisYearMwst);
-        element.addClass(thisYearTextColor);
-
-        element = $('#iTodayGr');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(todaySum + todayMwst);
-        element.addClass(todayTextColor);
-
-        element = $('#iThisWeekGr');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisWeekSum + thisWeekMwst);
-        element.addClass(thisWeekTextColor);
-
-        element = $('#iThisMonthGr');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisMonthSum + thisMonthMwst);
-        element.addClass(thisMonthTextColor);
-
-        element = $('#iThisYearGr');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisYearSum + thisYearMwst);
-        element.addClass(thisYearTextColor);
+    getFieldsRevenueFormatter: function () {
+        return [
+            'revenue',
+            'SumTotalProfitPercent',
+            'SumTotalProfitAbsolute',
+            'containsDailyPriceCount'
+        ];
     },
-    recalculateTopTable: function (data) {
-        var todaySum = 0.0; //heute
-        var todayMarAbs = 0.0;
-        var todayMwst = 0.0;
-        var thisWeekSum = 0.0; //diese Woche
-        var thisWeekMarAbs = 0.0;
-        var thisWeekMwst = 0.0;
-        var thisMonthSum = 0.0; //diesen Monat
-        var thisMonthMarAbs = 0.0;
-        var thisMonthMwst = 0.0;
-        var thisYearSum = 0.0; //dieses Jahr
-        var thisYearMarAbs = 0.0;
-        var thisYearMwst = 0.0;
-        var documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor;
-        documentTextColor = todayTextColor = thisWeekTextColor = thisMonthTextColor = thisYearTextColor = '';
+    getWasChangedRevenue: function (field, value) {
+        let result = false;
+        if (this.getFieldsRevenueFormatter().indexOf(field) !== -1)
+            result = true;
+        return result;
+    },
+    setDocumentsCollection: function (documents, silent) {
+        silent = silent === undefined ? false : silent;
+        _.each(documents, _document => {
+            let Model = new Invoice(_document, {parse: true});
+            let id = _document.Id;
 
-        data.forEach(function (value) {
-            var productTotalSum = value.SumTotalPrice;
-            var today = moment().format();
-            today = moment().startOf('day');
-            if (moment(value.OrderCreateTimestamp) > today) {
-                todaySum = todaySum + value.SumTotalPrice;
-                todayMarAbs += value.SumTotalProfitAbsolute;
-                todayTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount, todayTextColor);
-                value.Products.forEach(function (item) {
-                    todayMwst += item.TotalTax;
-                });
+            let ModelExisting = this.invoices.get(id);
+            if (ModelExisting !== undefined)
+                ModelExisting.set(Model.toJSON(), {silent: silent});
+
+            if (!this.isEqualCollections()) {
+                let ModelExisting = App.instance.invoices.get(id);
+                if(ModelExisting !== undefined)
+                    ModelExisting.set(Model.toJSON());
             }
-            var thisWeek = moment().format();
-            thisWeek = moment().startOf('day');
-            var day = moment().day();
-            var diff = moment().date() - day + (day == 0 ? -6 : 1);
-            thisWeek = moment().day('diff');
-            if (moment(value.OrderCreateTimestamp) > thisWeek) {
-                thisWeekSum += value.SumTotalPrice;
-                thisWeekMarAbs += value.SumTotalProfitAbsolute;
-                thisWeekTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount, thisWeekTextColor);
-                value.Products.forEach(function (item) {
-                    thisWeekMwst += item.TotalTax;
-                });
-            }
-            var thisMonth = moment().startOf('month');
-            if (moment(value.OrderCreateTimestamp) > thisMonth) {
-                thisMonthSum += value.SumTotalPrice;
-                thisMonthMarAbs += value.SumTotalProfitAbsolute;
-                thisMonthTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount, thisMonthTextColor);
-                value.Products.forEach(function (item) {
-                    thisMonthMwst += item.TotalTax;
-                });
-            }
-            var thisYear = moment().startOf('year');
-            if (moment(value.OrderCreateTimestamp) > thisYear) {
-                thisYearSum += value.SumTotalPrice;
-                thisYearMarAbs += value.SumTotalProfitAbsolute;
-                thisYearTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount, thisYearTextColor);
-                value.Products.forEach(function (item) {
-                    thisYearMwst += item.TotalTax;
-                });
-            }
+
         });
-        var result = {
-            todaySum: todaySum,
-            todayMarAbs: todayMarAbs,
-            todayMwst: todayMwst,
-            thisWeekSum: thisWeekSum,
-            thisWeekMarAbs: thisWeekMarAbs,
-            thisWeekMwst: thisWeekMwst,
-            thisMonthSum: thisMonthSum,
-            thisMonthMarAbs: thisMonthMarAbs,
-            thisMonthMwst: thisMonthMwst,
-            thisYearSum: thisYearSum,
-            thisYearMarAbs: thisYearMarAbs,
-            thisYearMwst: thisYearMwst,
-            dataTop: data,
-            documentTextColor: documentTextColor,
-            todayTextColor: todayTextColor,
-            thisWeekTextColor: thisWeekTextColor,
-            thisMonthTextColor: thisMonthTextColor,
-            thisYearTextColor: thisYearTextColor
+    },
+    setCollectionsAfterFetch: function (documents) {
+        let Models = _.map(documents, document => {
+            return new Invoice(document, {parse: true});
+        });
+
+        if (!this.isEqualCollections()) {
+            App.instance.invoices.set(Models);
+
+            let ModelsFiltred = _.filter(Models, _document => {
+                return _document.get('CustomerId') === this.customerId;
+            });
+            this.invoices.set(ModelsFiltred);
+        } else this.invoices.set(Models);
+    },
+});
+
+var CustomerDeliveryNotesView = DocumentTableView.extend({
+    isDeliveryNoteView: true,
+    el: '#delivery-notes-content',
+    template: _.template($('#delivery-notes-content-tpl').html()),
+    initialize: function (notes, invoices, customerId) {
+        this.customerId = customerId;
+        this.clusteredData = [];
+        this.filteredDataSortedClustered = [];
+        this.filter = {
+            DeliveryNoteNumber: '',
+            OrderCreateTimestamp: '',
+            ModifyTimestamp: '',
+            CompletedTimestamp: '',
+            InvoiceNumber: '',
+            FormattedStatus: 'Alle',
+            InvoiceStatusFormatted: 'Alle'
+        };
+        this.initializeCommonValues();
+
+        this.$parent_el = this.$el.closest('#delivery-note-list-modal');
+        this.$spinner = this.getSpinner();
+
+        this.$buttonMakeBills = this.$parent_el.find('#make-bills-button');
+        this.$buttonDownloadPdf = this.$parent_el.find('#download-pdf');
+        this.$buttonFinalize = this.$parent_el.find('#finalize-all-delivery-note-button');
+        this.$buttonDeleteSelected = this.$parent_el.find('#delete-selected-delivery-note-button');
+        this.$buttonCopyDN = this.$parent_el.find('#copy-delivery-note-button');
+        this.$buttonCutDN = this.$parent_el.find('#cut-delivery-note-button');
+
+        this.$buttonPageUp = this.$parent_el.find('.page-up-dn');
+        this.$buttonPageDown = this.$parent_el.find('.page-down-dn');
+
+        this.$buttonContraList = this.$parent_el.find('#open-invoices');
+
+        this.currentPeriod = this.getPeriod();
+        this.moneyTurnover = this.getTurnoverSetting();
+
+        this.notes = notes;//if this.customerId > 0 => new Backbone.Collection(notes.toJSON());
+        this.invoices = invoices;
+
+        this.listenTo(this.notes, 'change', this.changeTable);
+        this.listenTo(this.notes, 'remove', this.removeCollection);
+        this.listenTo(this.notes, 'update', this.updateTable);
+        this.listenTo(this.notes, 'reset', this.resetCollection);
+        this.listenTo(this.invoices, 'remove', this.removedInvoice);
+        this.listenTo(this.invoices, 'change', this.applyChangesInvoice);
+    },
+    setSelectOptionPaymentState: function (_document) {
+
+    },
+    getInvolvedContraDocumentFields: function () {
+        return ['SumTotalPrice', 'InvoiceNumber', 'InvoiceNumberIsDefault'];
+    },
+    getNoteField: function (invoice_field) {
+        let result = invoice_field;
+        switch (invoice_field) {
+            case 'SumTotalPrice':
+                result = 'revenue';
+                break;
         }
         return result;
     },
-    tableSwitchFilterHelper: function ($el) {
-        $el.find('.fht-cell input').attr('placeholder', 'Alle');
-        $el.find('.fht-cell select option:first-child').text('Alle');
-    },
-    addRowsOnScroll: function () {
-        var self = this;
-        var data = this.invoices.toJSON();
-        var countDocuments;
-        var scHeight = $('#invoice-scroll-listener').get(0).scrollHeight;
-        var clHeight = $('#invoice-scroll-listener').get(0).clientHeight;
-        var status = $('.bootstrap-table-filter-control-Status_invoices');
-        var parent = this;
-        var thisTable = this.$el.find('#invoices-table');
-        var pageUp = this.$el.closest('#invoice-list-modal').find('.page-up-dn');
-        var pageDown = this.$el.closest('#invoice-list-modal').find('.page-down-dn');
-        var end = data.length - 60;
-        var start = data.length - 30;
-        var newData = data.slice(end, start);
-        var showArrowsSummary;
-        if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-            showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-            if (showArrowsSummary == 'false') {
-                $('.arrowLineForTables span').css({'margin-left': '0'});
-            }
-        } else {
-            showArrowsSummary = 'true';
+    applyChangesInvoice: function (Invoice) {
+        let changes = Invoice.changed;
+        let invoice_id = Invoice.get('Id');
+
+        if(this.hasInvolvedField(changes)) {
+            let Notes = this.notes.findNoteInvoice(invoice_id);
+            let invoice_fields = this.getInvolvedContraDocumentFields();
+            _.each(Notes, Note => {
+                for (let i = 0; i < invoice_fields.length; i++) {
+                    let dn_field = this.getNoteField(invoice_fields[i]);
+                    if(dn_field === 'revenue') {
+                        let index_row = this.findIndexCollection(this.visibleData, Note.get('Id'));
+                        if(index_row !== -1)
+                            this.reRenderTurnoverField(this.visibleData[index_row], index_row);
+                    } else {
+                        if(changes.hasOwnProperty(invoice_fields[i]))
+                            Note.set(dn_field, changes[invoice_fields[i]]);
+                    }
+                }
+            });
         }
-        newData.forEach(function (value) {
-            value.showArrowsSummary = showArrowsSummary;
+    },
+    removedInvoice: function (model_removed) {
+        let dn_ids = model_removed.getDnIds();
+        if(dn_ids.length > 0) {
+            let row_index = this.getRowIndex(dn_ids[0]);
+            if (row_index !== -1) {
+                let cluster = this.getCluster(row_index);
+
+                _.each(dn_ids, id => {
+                    let DNote = this.notes.get(id);
+                    if(DNote !== undefined)
+                        DNote.setRemovedInvoice(cluster !== undefined);
+                });
+                if (cluster !== undefined) {
+                    this.updateView()
+                }
+            }
+        }
+    },
+    setChanges: function (newData) {
+        let id = newData['Id'];
+        let index = this.findIndexCollection(this.filteredData, id);
+        if(index !== -1)
+            this.filteredData[index] = newData;
+
+        index = this.findIndexCollection(this.filteredDataSorted, id);
+        if(index !== -1)
+            this.filteredDataSorted[index] = newData;
+
+        index = this.findIndexCollection(this.filteredDataSortedClustered, id);
+        if(index !== -1)
+            this.filteredDataSortedClustered[index] = newData;
+    },
+    applyChanges: function (Changes) {
+        let document_id = Changes.id;
+        let index_row = this.findIndexCollection(this.visibleData, document_id);
+        let available_fields = this.getFieldsAvailable();
+
+        if (index_row !== -1) {
+            let wasChangedRevenue = false,
+                wasChangedInvoiceNumberField = false,
+                wasChangedInvoiceNumberIsDefault = false,
+                wasAddedRevenue = false,
+                wasChangedCancelStatus = this.getWasChangedCancelStatus(Changes);
+
+            _.each(Changes.changed, (value, field) => {
+                let new_data = this.getNewData(Changes);
+                if (available_fields.indexOf(field) !== -1) {
+                    this.renderTd(value, field, new_data, index_row);
+                }
+                if(field === 'InvoiceStatusFormatted' || (field === 'InvoiceVersion' && Changes.get('InvoiceNumber') !== null))
+                    wasChangedInvoiceNumberField = true;
+                if(field === 'InvoiceNumberIsDefault') {
+                    this.setChanges(new_data);
+                    this.visibleData[index_row] = new_data;
+                    wasChangedInvoiceNumberIsDefault = true;
+                }
+                wasChangedRevenue = !wasChangedRevenue ? this.getWasChangedRevenue(field, value) : true;
+                wasAddedRevenue = !wasAddedRevenue ? this.getWasAddedRevenue(Changes, field) : true;
+            });
+            if (this.wasChangeMainNumber(Changes))
+                this.renderNumberColumn(index_row, 'DeliveryNoteNumber');
+
+            if (wasChangedRevenue === true || wasAddedRevenue === true || wasChangedCancelStatus === true) {
+                if(wasChangedRevenue === true || wasAddedRevenue === true)
+                    this.reRenderTurnoverField(this.visibleData[index_row], index_row);
+
+                customDelay(() => {
+                    this.renderTopTableAfterFiltered();
+                }, 500);
+            }
+            if((wasChangedInvoiceNumberField && !Changes.changed.hasOwnProperty('InvoiceNumber')) ||(
+                wasChangedInvoiceNumberIsDefault && Changes.get('InvoiceNumber') !== undefined)) {
+
+                this.renderNumberColumn(index_row, 'InvoiceNumber');
+            }
+        }
+    },
+    getWasAddedRevenue: function (Changes, field_changed) {
+        let result = false;
+
+        if(field_changed === 'InvoiceNumber' && Changes.previousAttributes()['InvoiceNumber'] === null)
+            result = true;
+
+        return result;
+    },
+    removeDocumentRows: function (removed) {
+        let $rows;
+        let cluster;
+        let wasCluster = false;
+        let hasMainRowCluster = false;
+        let needReloadTable = false;
+        _.each(removed, (_document) => {
+            let document_id = _document.get('Id');
+            let row_index = this.getRowIndex(document_id);
+            if (row_index !== -1) {
+                let $row = this.getRow(row_index);
+                if ($rows === undefined)
+                    $rows = $row;
+                else $rows = $rows.add($row);
+
+                cluster = this.getCluster(row_index);
+
+                if (cluster !== undefined) {
+                    wasCluster = true;
+                    hasMainRowCluster = hasMainRowCluster === true ? true : (cluster.index === row_index);
+                    this.renderOneCluster(cluster, true);
+                }
+            }
         });
-        $('#invoice-scroll-listener').scroll(function () {
-            if ($('#invoices-table')[0].rows[1].classList[0] == 'no-records-found') {
-                countDocuments = 0;
-            } else {
-                countDocuments = $('#invoices-table')[0].rows.length - 1;
+
+        if (hasMainRowCluster === true || (wasCluster === true && this.wasDeleteBill())) {
+            needReloadTable = true;
+        } else {
+            if ($rows !== undefined)
+                this.deleteTableRows($rows);
+            this.lastVisibleIndex -= removed.length;
+            _.each(removed, (_document) => {
+                let document_id = _document.get('Id');
+                this.filteredDataSorted.splice(this.findIndexCollection(this.filteredDataSorted, document_id), 1);
+                this.filteredDataSortedClustered.splice(this.findIndexCollection(this.filteredDataSortedClustered, document_id), 1);
+                this.visibleData.splice(this.findIndexCollection(this.visibleData, document_id), 1);
+            });
+
+            if (wasCluster === true) {
+                this.filteredDataSortedClustered = this.setCluster();
+                this.setAttributesTdClusters();
             }
-            pageUp.removeClass('arrowVisible');
-            pageDown.removeClass('arrowVisible');
-            pageUp.removeAttr('disabled');
-            pageDown.removeAttr('disabled');
-            if ((end <= 0) && (scHeight <= (clHeight + $('#invoice-scroll-listener').scrollTop() + 1))) {
-                pageDown.attr('disabled', 'disabled');
-                pageDown.addClass('arrowVisible');
+        }
+        return needReloadTable;
+    },
+    getFieldsRevenueFormatter: function () {
+        return [
+            'revenue',
+            'SumTotalProfitPercent',
+            'SumTotalProfitAbsolute',
+            'containsDailyPriceCount'
+        ];
+    },
+    setHandlers: function () {
+        this.setHandlersCommonToolbar();
+        this.setHandlersCommonTable();
+        this.setHandlersCommonParent();
+        this.setHandlersCommonButtons();
+        this.setHandlersCommonRows();
+
+        this.getToolbar().find('#deliveryNoteCluster').off('change').on('change', (e) => {
+            this.changeCluster(e);
+        });
+        this.getToolbar().find('#needFinalizeDeliveryNote').off('change').on('change', (e) => {
+            this.changeCheckboxSetting(e);
+        });
+        this.getToolbar().find('#deleteDnWithInvoice').off('change').on('change', (e) => {
+            this.changeCheckboxSetting(e);
+        });
+
+        this.$buttonMakeBills.off('click').on('click', () => {
+            this.makeBills();
+        });
+
+        this.$buttonDownloadPdf.off('click').on('click', () => {
+            this.downloadPdf();
+        });
+    },
+    makeBills: function () {
+        let documents = this.getAllSelectedDocuments();
+        let ids = [];
+        _.each(documents, function (document) {
+            if (document.InvoiceId === null) {
+                ids.push(document.Id);
             }
-            if ($('#invoice-scroll-listener').scrollTop() == 0) {
-                pageUp.attr('disabled', 'disabled');
-                pageUp.addClass('arrowVisible');
+        });
+        if (ids.length == 0) {
+            Matrex.notify('Für diese Artikel kann keine Rechnung erstellt werden', 'warning');
+            return false;
+        }
+        this.disabledForm();
+        App.api.document.delivery_note.make_bills(ids).then(
+            (resp) => {
+                this.enabledForm();
+                let documents = resp['delivery_notes'];
+                let invoice = resp['invoice'];
+
+                let ModelInvoice = new Invoice(invoice, {parse: true});
+                this.invoices.add(ModelInvoice);
+
+                if (this.getClusterSetting() === true && documents.length > 1) {
+                    this.setDocumentsCollection(documents, true);
+                    this.notes.trigger('reset');
+                } else {
+                    this.setDocumentsCollection(documents);
+                    this.renderParentButtonsStatus();
+                }
+
+                Matrex.notify('Rechnung wurde erstellt.', 'success');
+            },
+            (model, response, options) => {
+                this.enabledForm();
+                displayErrorBackbone(model, response, options);
             }
-            if (scHeight <= (clHeight + $('#invoice-scroll-listener').scrollTop() + 40)) {
-                var scTop = $('#invoice-scroll-listener').scrollTop();
-                if (status.get(0).value == '') {
-                    if (countDocuments < data.length) {
-                        if (end >= 0) {
-                            thisTable.bootstrapTable('append', newData);
-                            start -= 30;
-                            end -= 30;
-                            scHeight = $('#invoice-scroll-listener').get(0).scrollHeight;
-                            clHeight = $('#invoice-scroll-listener').get(0).clientHeight;
-                            newData = data.slice(end, start);
-                            if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-                                showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-                                if (showArrowsSummary == 'false') {
-                                    $('.arrowLineForTables span').css({'margin-left': '0'});
-                                }
-                            } else {
-                                showArrowsSummary = 'true';
+        );
+    },
+    downloadPdf: function () {
+        var selected_DNs = this.getAllSelectedDocuments();
+        var arrIds = [];
+
+        _.each(selected_DNs, (selected_DN) => {
+            arrIds.push(selected_DN.Id);
+        });
+
+        var url = getApiUrl() + '/download/pdfs/' + App.instance.thisUser.getSellerSuper() + '/delivery_note/' + arrIds.join('-')  + '?format=zip';
+        var pdf = window.open(url, '_system');
+
+        Matrex.notify('Dateien erfolgreich zum download gesendet.', 'success');
+    },
+    finalizeDocuments: function () {
+        let documents = this.getAllSelectedDocuments();
+        let ids = [];
+        _.each(documents, function (document) {
+            if (document.CompletedTimestamp === "0000-00-00 00:00:00")
+                ids.push(document.Id);
+        });
+
+        if (ids.length == 0) {
+            Matrex.notify('Nichts zu finalisieren', 'warning');
+            return false;
+        }
+        this.disabledForm();
+        App.api.document.delivery_note.finalize(ids).then(
+            (documents) => {
+                this.enabledForm();
+                this.setDocumentsCollection(documents);
+                this.renderParentButtonsStatus();
+                Matrex.notify('Lieferschein wurde abgeschlossen.', 'success');
+            },
+            (model, response, options) => {
+                this.enabledForm();
+                displayErrorBackbone(model, response, options);
+            }
+        );
+    },
+    openContraTable: function () {
+        if(this.customerId === 0)
+            App.instance.customerFilterBarView.allInvoices();
+        else {
+            let invoices = new Invoices();
+            invoices.reset(this.invoices.where({CustomerId: this.customerId}));
+
+            let Customer = App.instance.customers.find(Customer => {
+                return Customer.get('Id') === this.customerId;
+            });
+            let tempView = new CustomerListItemView(
+                Customer.toJSON(),
+                undefined,
+                undefined,
+                invoices
+            );
+            setTimeout(() => {
+                tempView.showInvoices();
+            }, 0);
+        }
+    },
+    getInvolvedRenderInvoiceField: function () {
+        return [
+            'revenue',
+            'InvoiceNumber',
+            'FormattedStatus'
+        ];
+    },
+    hasInvolvedRenderInvoiceField: function (changes) {
+        let fields_involved = this.getInvolvedRenderInvoiceField();
+        let field = _.find(changes, (value, field) => {
+            return fields_involved.indexOf(field) !== -1;
+        });
+
+        return field !== undefined;
+    },
+    renderAfterChangeInvoice: function (invoice) {
+        if (invoice.get('sourceDeliveryNotes') !== null)
+            _.each(invoice.get('sourceDeliveryNotes'), Dn => {
+                let DNote = App.instance.deliveryNotes.get(Dn.Id);
+                if (DNote !== undefined) {
+                    DNote.fetch({
+                        success: () => {
+                            if (!this.isEqualCollections()) {
+                                let thisNote = this.notes.get(Dn.Id);
+                                if (thisNote !== undefined)
+                                    thisNote.set(DNote.toJSON());
                             }
-                            newData.forEach(function (value) {
-                                value.showArrowsSummary = showArrowsSummary;
-                                var productTotalSum = value.SumTotalPrice;
-                                var documentTextColor;
-                                var valueTax = 0.0;
-                                value.Products.forEach(function (item) {
-                                    valueTax += item.TotalTax;
-                                });
-                                var productTotalSumWithTax = productTotalSum + valueTax;
-                                var revenueBruttoString = formatProfitForPrint(productTotalSumWithTax);
-                                var revenueString = formatProfitForPrint(productTotalSum);
-                                if (revenueString === '-') {
-                                    value.revenue = '-';
-                                } else {
-                                    var revenueInvoice = 0;
-                                    if (App.instance.invoices) {
-                                        var invoice_id = value.InvoiceId;
-                                        if (invoice_id !== null) {
-                                            var Invoices_collection = App.instance.invoices;
-                                            var invoice = Invoices_collection.get(invoice_id);
-                                            if (invoice != undefined) {
-                                                revenueInvoice = typeof invoice.get('SumTotalPrice') !== 'undefined' ? invoice.get('SumTotalPrice') : null;
-                                                revenueInvoice = ' \u20AC ' + formatProfitForPrint(revenueInvoice);
-                                            }
-                                        } else {
-                                            revenueInvoice = '-';
-                                        }
-                                    }
-                                    documentTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount);
-                                    var nettoHidedClass = self.currentUmsatz === 'netto' ? '' : ' hided-content';
-                                    var bruttoHidedClass = self.currentUmsatz === 'brutto' ? '' : ' hided-content';
-                                    value.revenue = '<div class="revenueLine' + nettoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueString + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span></div>' +
-                                        '<div class="revenueLineBruttoUmsatz' + bruttoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueBruttoString + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span></div>';
-                                }
+                        }
+                    });
+                }
+            });
+    },
+    deleteDocuments: function () {
+        let self = this;
+        let text = 'Ausgewählte Lieferscheinen löschen?';
+        Matrex.confirm(text, function () {
+            let Dns = self.getAllSelectedDocuments();
+            let ids = _.pluck(Dns, 'Id');
+
+            let invoiceIds = [];
+            _.each(Dns, (Dn) => {
+                if (Dn.InvoiceId !== null && invoiceIds.indexOf(Dn.InvoiceId) === -1)
+                    invoiceIds.push(Dn.InvoiceId);
+            });
+
+            if (!self.isChangingDataBackendDelete()) {
+                App.api.document.delivery_note.delete_not_changes(ids).then(
+                    () => {
+                        self.fetchInvoices(invoiceIds);
+                    }
+                );
+                self.removeDocumentsCollection(ids);
+            } else {
+                self.disabledForm();
+                App.api.document.delivery_note.deleteFetch(ids).then(
+                    (all_documents) => {
+                        self.setCollectionsAfterFetch(all_documents);
+                        if(self.wasDeleteBill()) {
+                            if(self.wasRenameDeletedDocuments())
+                                App.instance.invoices.fetch();
+                            else App.instance.invoices.remove(invoiceIds);
+                        } else self.fetchInvoices(invoiceIds);
+
+                        self.enabledForm();
+                    },
+                    () => {
+                        self.enabledForm();
+                    }
+                );
+            }
+        }, function () {
+        });
+    },
+    setDocumentsCollection: function (documents, silent) {
+        silent = silent === undefined ? false : silent;
+        _.each(documents, _document => {
+            let Model = new DeliveryNote(_document, {parse: true});
+            let id = _document.Id;
+            if (!this.isEqualCollections()) {
+                App.instance.deliveryNotes.get(id).set(Model.toJSON());
+
+                let ModelExisting = this.notes.get(id);
+                if (ModelExisting !== undefined)
+                    ModelExisting.set(Model.toJSON(), {silent: silent});
+            } else {
+                this.notes.get(id).set(Model.toJSON(), {silent: silent});
+                if (silent === true) {
+                    let order_id = Model.getOrderId();
+                    App.instance.orders.get(order_id).fetch();
+                }
+            }
+        });
+    },
+    setCollectionsAfterFetch: function (documents) {
+        let Models = _.map(documents, document => {
+            return new DeliveryNote(document, {parse: true});
+        });
+
+        if (!this.isEqualCollections()) {
+            App.instance.deliveryNotes.set(Models);
+
+            let ModelsFiltered = _.filter(Models, _document => {
+                return _document.get('CustomerId') === this.customerId;
+            });
+            this.notes.set(ModelsFiltered);
+        } else this.notes.set(Models);
+    },
+    fetchInvoices: function (ids) {
+        _.each(ids, id => {
+            let Invoice = this.invoices.get(id);
+            if (Invoice !== undefined)
+                Invoice.fetch();
+        });
+    },
+    renderParentButtonsStatus: function () {
+        clearTimeout(this.timerRenderParentButtonsStatus);
+        this.timerRenderParentButtonsStatus = setTimeout(
+            () => {
+                let selected_DNs = this.getAllSelectedDocuments();
+                this.changeCheckedDocument(selected_DNs.length);
+                let arguments_changed = this.initializeAngumentChangedButton(selected_DNs.length);
+                _.each(selected_DNs, (selected_DN) => {
+                    let firstCustomer = selected_DNs[0].CustomerId;
+                    arguments_changed = this.getArgumentChangedButton(selected_DN, arguments_changed, firstCustomer);
+                });
+                this.changeDisableButton(arguments_changed);
+                this.changeTitleFooterButtons(arguments_changed);
+            }, 200
+        );
+    },
+    checkAll: function () {
+        let checkboxs = this.getCheckbox();
+        let arguments_changed = this.initializeAngumentChangedButton(checkboxs.length);
+        if (checkboxs.length > 0) {
+            this.changeCheckedDocument(checkboxs.length);
+            let firstCustomer = this.visibleData[0].CustomerId;
+            _.each(checkboxs, (checkbox) => {
+                let $checkbox = $(checkbox);
+                $checkbox.prop('checked', true);
+
+                let _document = this.getVisibleDocument(this.getDataIndexCheckbox(checkbox));
+                arguments_changed = this.getArgumentChangedButton(_document, arguments_changed, firstCustomer);
+            });
+        }
+        this.changeDisableButton(arguments_changed);
+        this.changeTitleFooterButtons(arguments_changed);
+    },
+    uncheckAll: function () {
+        let checkboxs = this.getCheckedCheckbox();
+        _.each(checkboxs, (checkbox) => {
+            $(checkbox).prop('checked', false);
+        });
+        this.changeCheckedDocument(0);
+        this.changeDisableButton();
+        this.setDefaultTitleButtons();
+    },
+    setAllHasBillCanceled: function (_arguments, selected_DN) {
+        let prev_value = _arguments.allHasBillCanceled;
+        let result = prev_value;
+        if (prev_value === null) {
+            if (selected_DN.InvoiceId === null && selected_DN.Status !== 'Canceled')
+                result = false;
+            else result = true;
+        } else if (prev_value === true && selected_DN.InvoiceId === null && selected_DN.Status !== 'Canceled')
+            result = false;
+
+        return result;
+    },
+    setAllHasBill: function (_arguments, invoice_id) {
+        let prev_value = _arguments.allHasBill;
+        let result = prev_value;
+        if (prev_value === null) {
+            if (invoice_id === null)
+                result = false;
+            else result = true;
+        } else if (prev_value === true && invoice_id === null)
+            result = false;
+
+        return result;
+    },
+    getCountAllData: function () {
+        return this.filteredDataSortedClustered.length;
+    },
+    getClusterSetting: function () {
+        if (this.isMobile())
+            return false;
+
+        return App.instance.thisUser.getSetting('deliveryNoteCluster') === 'true';
+    },
+    closeView: function () {
+        this.hideParentElements();
+        this.stopListening();
+
+        App.instance.selectionModel.set('CustomerDeliveryNotesView_CustomerId', 0);
+    },
+    getTable: function () {
+        return this.$el.find('#delivery-notes-table');
+    },
+    setDefaultTitleButtons: function () {
+        let default_title_copyDNButton = "Lieferschein kopieren",
+            default_title_makeBillsButton = "Rechnung erstellen",
+            default_title_cutDNButton = "Neuer Kunde für diesen Lieferschein",
+            default_title_deleteSelectedButton = "Löschen",
+            default_title_FinalizeButton = "Lieferschein finalisieren",
+            title_downloadPdfs = "Pdf herunterladen";
+
+        this.$buttonDownloadPdf.attr('title', title_downloadPdfs);
+        this.$buttonMakeBills.attr('title', default_title_makeBillsButton);
+        this.$buttonFinalize.attr('title', default_title_FinalizeButton);
+        this.$buttonDeleteSelected.attr('title', default_title_deleteSelectedButton);
+        this.$buttonCopyDN.attr('title', default_title_copyDNButton);
+        this.$buttonCutDN.attr('title', default_title_cutDNButton);
+    },
+    setRevenues: function () {
+        this.notes.forEach(Note => {
+            Note.set('revenue', this.getRevenue(Note), {silent: true})
+        });
+    },
+    getSortName: function () {
+        return App.instance.thisUser.getSetting('sortsDNList_name');
+    },
+    getSortDirection: function () {
+        return App.instance.thisUser.getSetting('sortsDNList_direct');
+    },
+    renderToolbarSetting: function () {
+        let $toolBar = this.getToolbar();
+
+        if (App.instance.thisUser.getSetting('needFinalizeDeliveryNote') == 'true')
+            $toolBar.find('#needFinalizeDeliveryNote').prop("checked", true);
+        else
+            $toolBar.find('#needFinalizeDeliveryNote').prop("checked", false);
+
+        if (this.getClusterSetting())
+            $toolBar.find('#deliveryNoteCluster').prop("checked", true);
+        else
+            $toolBar.find('#deliveryNoteCluster').prop("checked", false);
+
+        if (App.instance.thisUser.getSetting('deleteDnWithInvoice') == 'true')
+            $toolBar.find('#deleteDnWithInvoice').prop("checked", true);
+        else
+            $toolBar.find('#deleteDnWithInvoice').prop("checked", false);
+
+
+        if (App.instance.thisUser.getSetting('showArrowsSummary') == 'false') {
+            this.$el.find('.arrowLineForTables i').css({'display': 'none'});
+            this.$el.find('.arrowLineForTables span').css({'margin-left': '0'});
+        }
+
+        this.$buttonPeriod = this.getButtonPeriod();
+        this.$buttonPeriod.html('<span>' + this.formatPeriodDE() + '</span> <span class="caret"></span>');
+        $toolBar.find('input[type = radio][name = period-document]').filter('[value = ' + this.currentPeriod + ']').prop('checked', true);
+
+        $toolBar.find('input[type = radio][name = turnover]').filter('[value = ' + this.moneyTurnover + ']').prop('checked', true);
+
+        this.$buttonTax = this.getButtonTax();
+        this.setTextButtonTax();
+
+        if (App.instance.thisUser.getSetting('DNListShowColumn_OrderCreateTimestamp') == 'true')
+            $toolBar.find('input.add-column-menu#DNListShowColumn_OrderCreateTimestamp').prop('checked', true);
+        if (App.instance.thisUser.getSetting('DNListShowColumn_ModifyTimestamp') == 'true')
+            $toolBar.find('input.add-column-menu#DNListShowColumn_ModifyTimestamp').prop('checked', true);
+        if (App.instance.thisUser.getSetting('DNListShowColumn_CompletedTimestamp') == 'true')
+            $toolBar.find('input.add-column-menu#DNListShowColumn_CompletedTimestamp').prop('checked', true);
+        if (App.instance.thisUser.getSetting('DNListShowColumn_FormattedStatus') == 'true')
+            $toolBar.find('input.add-column-menu#DNListShowColumn_FormattedStatus').prop('checked', true);
+        if (App.instance.thisUser.getSetting('DNListShowColumn_InvoiceNumber') == 'true')
+            $toolBar.find('input.add-column-menu#DNListShowColumn_InvoiceNumber').prop('checked', true);
+        if (App.instance.thisUser.getSetting('DNListShowColumn_InvoiceStatusFormatted') == 'true')
+            $toolBar.find('input.add-column-menu#DNListShowColumn_InvoiceStatusFormatted').prop('checked', true);
+        if (App.instance.thisUser.getSetting('DNListShowColumn_revenue') == 'true')
+            $toolBar.find('input.add-column-menu#DNListShowColumn_revenue').prop('checked', true);
+    },
+    getTurnoverSetting: function () {
+        return App.instance.thisUser.getSetting('taxDNList');
+    },
+    changeCluster: function (e) {
+        this.changeCheckboxSetting(e);
+
+        this.setRenderingData();
+        this.reloadTable();
+    },
+    setCluster: function (documents) {
+        if (documents === undefined)
+            documents = _.clone(this.filteredDataSorted);
+        this.clusteredData = [];
+
+        if (this.getClusterSetting()) {
+            /**
+             * @type {Map <String invoiceNumber, String[] documentNumber>}
+             */
+            let clusterMap = new Map();
+            _.each(documents, (document) => {
+                let invoiceNumber = document.InvoiceNumber;
+                if (invoiceNumber !== undefined && invoiceNumber !== null) {
+                    let documentNumbers = [];
+                    if (clusterMap.has(invoiceNumber)) {
+                        documentNumbers = clusterMap.get(invoiceNumber);
+                        clusterMap.set(invoiceNumber, documentNumbers);
+                    }
+                    documentNumbers.push(document.Id);
+                    clusterMap.set(invoiceNumber, documentNumbers);
+                }
+            });
+            for (let entry of clusterMap) {
+                let documentIds = entry[1];
+                let invoiceId = entry[0];
+                if (documentIds.length > 1) {
+
+                    let serial_number = 0;
+                    let documentsCluster = [];
+
+                    let index_first_document;
+                    documentIds.forEach((document_id) => {
+                        serial_number++;
+
+                        if (serial_number === 1) {
+                            index_first_document = _.findIndex(documents, (document) => {
+                                return document.Id === document_id
                             });
-                            if (self.currentUmsatz === 'brutto') {
-                                var elementsToShow = document.getElementsByClassName('revenueLineBruttoUmsatz');
-                                var elementsToHide = document.getElementsByClassName('revenueLine');
-                                _.each(elementsToShow, function (row) {
-                                    row.classList.remove("hided-content");
-                                });
-                                _.each(elementsToHide, function (row) {
-                                    row.classList.add("hided-content");
-                                });
-                            }
-                            parent.processedData = data;
-                            parent.paginationNewData = newData;
-                            return parent.paginationNewData;
-                        } else {
-                            end = 0;
+                            return;
                         }
-                    }
+
+                        let index_deleted = _.findIndex(documents, (document) => {
+                            return document.Id === document_id
+                        });
+                        documentsCluster.push(documents[index_deleted]);
+
+                        documents.splice(index_deleted, 1);
+                    });
+                    let index_past = index_first_document;
+                    documentsCluster.forEach((documentCluster) => {
+                        documents.splice(index_past + 1, 0, documentCluster);
+                        index_past++;
+                    });
+                    this.clusteredData.push({
+                        index: index_first_document,
+                        field: 'InvoiceNumber',
+                        rowspan: documentsCluster.length + 1
+                    });
                 }
             }
-        });
-    },
-    changeCheckboxSetting: function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-
-        var self = this;
-        var codeSetting = e.target.getAttribute('id');
-        var target = this.$el.find('#' + codeSetting);
-        var value = target.prop('checked');
-
-        disabledElementForSlowConnection();
-
-        App.api.user.changeSetting.put(target[0].tagName.toLowerCase(), codeSetting, value).then(function (resp) {
-            var setting_value = resp.toString();
-            var settings = _.clone(App.instance.thisUser.get('setting'));
-
-            if (settings) {
-                if (codeSetting in settings) {
-                    settings[codeSetting] = setting_value;
-                }
-            } else {
-                settings = [];
-                settings[codeSetting] = setting_value;
-            }
-            App.instance.thisUser.set('setting', settings);
-
-            self.render();
-            includedElementForSlowConnection();
-        });
-    },
-    replacementData: function(){
-        this.processedData = this.invoices.toJSON();
-    },
-    changePeriodSetting: function(e) {
-        var codeSetting = 'periodForIN_' + e.target.getAttribute('id').split('-')[0] + 'Invoice';
-        var target = 'periodForIN_';
-        var value = 'true';
-        var elements = ['periodForIN_allInvoice',
-            'periodForIN_monthInvoice',
-            'periodForIN_sevendaysInvoice',
-            'periodForIN_todayInvoice',
-            'periodForIN_weekInvoice',
-            'periodForIN_yearInvoice',
-            'periodForIN_yesterdayInvoice'];
-        var showArrowsSummary;
-        disabledElementForSlowConnection();
-
-        App.api.user.changeSetting.put(target, codeSetting, value).then(function (resp) {
-            var setting_value = resp.toString();
-            var settings = _.clone(App.instance.thisUser.get('setting'));
-
-            _.map(elements, function(element) {
-                if (element in settings) {
-                    return settings[element] = 'false';
-                }
-            });
-
-            if (settings) {
-                if (codeSetting in settings) {
-                    settings[codeSetting] = setting_value;
-                }
-            } else {
-                settings = [];
-                settings[codeSetting] = setting_value;
-            }
-            App.instance.thisUser.set('setting', settings);
-
-            includedElementForSlowConnection();
-            if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-                showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-                if (showArrowsSummary == 'false') {
-                    $('.arrowLineForTables i').css({'display': 'none'});
-                    $('.arrowLineForTables span').css({'margin-left': '0'});
-                }
-            }
-        });
-
-        var dataForTopTable = this.recalculateTopTable($('#invoices-table').bootstrapTable('getData'));
-
-        var todaySum = dataForTopTable.todaySum;
-        var todayMarAbs = dataForTopTable.todayMarAbs;
-        var todayMwst = dataForTopTable.todayMwst;
-        var thisWeekSum = dataForTopTable.thisWeekSum;
-        var thisWeekMarAbs = dataForTopTable.thisWeekMarAbs;
-        var thisWeekMwst = dataForTopTable.thisWeekMwst;
-        var thisMonthSum = dataForTopTable.thisMonthSum;
-        var thisMonthMarAbs = dataForTopTable.thisMonthMarAbs;
-        var thisMonthMwst = dataForTopTable.thisMonthMwst;
-        var thisYearSum = dataForTopTable.thisYearSum;
-        var thisYearMarAbs = dataForTopTable.thisYearMarAbs;
-        var thisYearMwst = dataForTopTable.thisYearMwst;
-        var documentTextColor = dataForTopTable.documentTextColor;
-        var todayTextColor = dataForTopTable.todayTextColor;
-        var thisWeekTextColor = dataForTopTable.thisWeekTextColor;
-        var thisMonthTextColor = dataForTopTable.thisMonthTextColor;
-        var thisYearTextColor = dataForTopTable.thisYearTextColor;
-
-        // dataForTopTable.dataTop.forEach(function (value) {
-        //     var productTotalSum = value.SumTotalPrice;
-        //     var revenueString = formatProfitForPrint(productTotalSum);
-        //     if (revenueString === '-') {
-        //         value.revenue = '-';
-        //     } else {
-        //         documentTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount);
-        //
-        //         value.revenue = '<span class="' + documentTextColor + '">\u20AC ' + revenueString + '</span> / ' +
-        //             '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-        //             '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span>';
-        //     }
-        //     if (value.sourceDeliveryNotes != null && value.sourceDeliveryNotes != undefined && value.sourceDeliveryNotes.length > 0) {
-        //         value.sourceDeliveryNotes.forEach(function (note) {
-        //             self.deliveryNotes.models.forEach(function (noteCompany) {
-        //                 if (noteCompany.attributes.DeliveryNoteNumber == note.DeliveryNoteNumber) {
-        //                     note.DeliveryNoteNumber = note.DeliveryNoteNumber + " (" + noteCompany.attributes.Company + ")";
-        //                 }
-        //             });
-        //         });
-        //     }
-        // });
-
-        this.renderTopTable(todaySum, todayMarAbs, todayMwst, thisWeekSum, thisWeekMarAbs, thisWeekMwst, thisMonthSum, thisMonthMarAbs, thisMonthMwst,
-            thisYearSum, thisYearMarAbs, thisYearMwst, documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor);
-    },
-    forSlowConnection: function (e) {
-        disabledElementForSlowConnection();
-    }
-});
-var CustomerDeliveryNotesView = Backbone.View.extend({
-    el: '#delivery-notes-content',
-    DeliveryNoteNumberColSort: 'no',
-    OrderCreateTimestampColSort: 'no',
-    ModifyTimestampColSort: 'no',
-    CompletedTimestampColSort: 'no',
-    FormattedStatusColSort: 'no',
-    InvoiceNumberColSort: 'no',
-    revenueColSort: 'no',
-    currentUmsatz: 'netto',
-    InvoiceNumberForStatusColSort: 'no',
-    clustered: true,
-    flag: 0,
-    groupsWithItems: [],
-    currentPeriod: 'all',
-    processedData: [],
-    paginationNewData: [],
-    lastClicked: '',
-    lastClickedInvoice: '',
-    calculedNotes: [],
-    events: {
-        'click .show-delivery-note': 'selectDeliveryNote',
-        'click .show-invoice': 'selectInvoice',
-        'change #columnItemOrderCreateTimestamp': 'changeCheckboxSetting',
-        'change #columnItemModifyTimestamp': 'changeCheckboxSetting',
-        'change #columnItemCompletedTimestamp': 'changeCheckboxSetting',
-        'change #deliveryNoteCluster': 'changeCheckboxSetting',
-        'click #date-group-dropdown-delivery': 'replacementData',
-        'click .sortable': 'forSlowConnection',
-        'click input[name="umsatz"]': 'umsatzChanged'
-        // 'change #toolbar-status-select': 'select'
-    },
-    template: _.template($('#delivery-notes-content-tpl').html()),
-    initialize: function (notes, invoices, customerId) {
-        var self = this;
-        this.invoices = invoices;
-        this.customerId = customerId;
-        var deletedInvoices = invoices.models.map(function (item) {
-            if (item.attributes.DeleteTimestamp !== '0000-00-00 00:00:00') {
-                var createDate = Date.parse(item.attributes.CreateTimestamp);
-                var deleteDate = Date.parse(item.attributes.DeleteTimestamp);
-                if (createDate < deleteDate) {
-                    return item.attributes.Id;
-                }
-            }
-        });
-        var notesData = notes.models.map(function (item) {
-            item.attributes.deleted = false;
-            if (item.attributes.DeleteTimestamp !== '0000-00-00 00:00:00') {
-                var createDate = Date.parse(item.attributes.CreateTimestamp);
-                var deleteDate = Date.parse(item.attributes.DeleteTimestamp);
-                if (createDate < deleteDate) {
-                    item.attributes.deleted = true;
-                }
-            }
-            if (deletedInvoices.includes(item.attributes.Id)) {
-                item.attributes.InvoiceId = null;
-                item.attributes.InvoiceNumber = null;
-                item.attributes.InvoiceNumberForStatus = null;
-                item.attributes.InvoiceStatus = null;
-                item.attributes.InvoiceTitle = null;
-            }
-            return item;
-        });
-        notesData = $.grep(notesData, function(item){
-            return item.attributes.deleted !== true;
-        });
-        this.invoices = invoices;
-        notes.models = notesData;
-        var notesJs = notes.toJSON();
-        notesJs.forEach(function (value) {
-            var productTotalSum = value.SumTotalPrice;
-            var revenueString = formatProfitForPrint(productTotalSum);
-            var valueTax = 0.0;
-            value.Products.forEach(function (item) {
-                valueTax += item.TotalTax;
-            });
-            var productTotalSumWithTax = productTotalSum + valueTax;
-            var revenueBruttoString = formatProfitForPrint(productTotalSumWithTax);
-            if (revenueString === '-') {
-                value.revenue = '-';
-            } else {
-                var revenueInvoice = 0;
-
-                if (App.instance.invoices) {
-                    var invoice_id = value.InvoiceId;
-                    if (invoice_id !== null) {
-
-                        var Invoices_collection = App.instance.invoices;
-                        var invoice = Invoices_collection.get(invoice_id);
-
-                        if(invoice != undefined) {
-                            revenueInvoice = typeof invoice.get('SumTotalPrice') !== 'undefined' ? invoice.get('SumTotalPrice') : null;
-                            revenueInvoice = ' \u20AC ' + formatProfitForPrint(revenueInvoice);
-                        }
-                    } else {
-                        revenueInvoice = '-';
-                    }
-                }
-                documentTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount);
-
-                var nettoHidedClass = self.currentUmsatz === 'netto' ? '' : ' hided-content';
-                var bruttoHidedClass = self.currentUmsatz === 'brutto' ? '' : ' hided-content';
-                value.revenue = '<div class="revenueLine' + nettoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueString + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>' +
-                    '<div class="revenueLineBruttoUmsatz' + bruttoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueBruttoString + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>';
-            }
-        });
-        this.calculedNotes = notesJs;
-        this.notes = notes;
-        App.instance.deliveryNotes.on("change", this.update, this);
-        App.instance.deliveryNotes.once("update", this.render, this);
-        // $(this).find('.show-delivery-note').removeClass('clicked');
-    },
-    selectDeliveryNote: function (e) {
-        var deliveryNoteId = e.currentTarget.dataset.id;
-        if (window.innerWidth <= 480) {
-            if (this.flag == deliveryNoteId) {
-                this.lastClicked = '';
-                this.lastClickedInvoice = '';
-                this.$el.find('.show-delivery-note,.show-invoice').each(function () {
-                    this.classList.remove('last-clicked');
-                });
-                this.lastClicked = deliveryNoteId;
-                App.instance.selectionModel.set('SelectedDeliveryNoteId', deliveryNoteId);
-                $('.popover').hide();
-                this.flag = 0;
-            } else {
-                e.preventDefault();
-                e.stopPropagation();
-                $('.popover').hide();
-                $(e.target).popover('show');
-                this.flag = deliveryNoteId;
-                setTimeout(function () {
-                    $('.popover').hide();
-                }, 3000);
-            }
-        } else {
-            this.lastClicked = '';
-            this.lastClickedInvoice = '';
-            this.$el.find('.show-delivery-note,.show-invoice').each(function () {
-                this.classList.remove('last-clicked');
-            });
-            this.lastClicked = deliveryNoteId;
-            App.instance.selectionModel.set('SelectedDeliveryNoteId', deliveryNoteId);
         }
+        return documents;
     },
-    selectInvoice: function (e) {
-        var invoiceId = e.currentTarget.dataset.id;
-        var self = this;
-        if (window.innerWidth <= 480) {
-            if (this.flag == invoiceId) {
-                this.lastClicked = '';
-                this.lastClickedInvoice = '';
-                this.$el.find('.show-delivery-note,.show-invoice').each(function () {
-                    this.classList.remove('last-clicked');
-                });
-                this.lastClickedInvoice = invoiceId;
-                App.instance.selectionModel.set('SelectedInvoiceId', invoiceId);
-                this.$el.find('.show-invoice').each(function () {
-                    if (this.dataset.id == self.lastClickedInvoice) {
-                        this.classList.add('last-clicked');
-                    }
-                });
-                $('.popover').hide();
-                this.flag = 0;
-            } else {
-                e.preventDefault();
-                e.stopPropagation();
-                $('.popover').hide();
-                $(e.target).popover('show');
-                this.flag = invoiceId;
-                setTimeout(function () {
-                    $('.popover').hide();
-                }, 3000);
-            }
-        } else {
-            this.lastClicked = '';
-            this.lastClickedInvoice = '';
-            this.$el.find('.show-delivery-note,.show-invoice').each(function () {
-                this.classList.remove('last-clicked');
-            });
-            this.lastClickedInvoice = invoiceId;
-            App.instance.selectionModel.set('SelectedInvoiceId', invoiceId);
-            this.$el.find('.show-invoice').each(function () {
-                if (this.dataset.id == self.lastClickedInvoice) {
-                    this.classList.add('last-clicked');
-                }
-            });
-        }
+    disableMainButton: function () {
+        this.$buttonMakeBills.add(this.$buttonFinalize).add(this.$buttonDeleteSelected).add(this.$buttonCopyDN)
+            .add(this.$buttonCutDN).prop('disabled', true);
     },
-    update: function (collection) {
-        // if ($('#LetzteBearbeitungLieferschein').prop("checked") == 'true') {
-        //     $('#LetzteBearbeitungLieferschein').attr("checked","checked");
-        // } else {
-        //     $('#LetzteBearbeitungLieferschein').removeAttr("checked");
-        // }
-        // if ($('#Finalisiert').prop("checked") == 'true') {
-        //     $('#Finalisiert').attr("checked","checked");
-        // } else {
-        //     $('#Finalisiert').removeAttr("checked");
-        // }
+    setLastVisibleIndex: function () {
+        this.lastVisibleIndex =
+            this.filteredDataSortedClustered.length > this.countOnPage ?
+                this.countOnPage * (this.pageNumber + 1) - 1 : this.filteredDataSortedClustered.length - 1;
 
-        if (this.customerId == 0) {
-            this.notes.reset(collection.collection.models);
-        } else {
-            this.notes.reset(collection.collection.where({CustomerId: this.customerId}));
-        }
-        this.render();
-        var self = this;
-        setTimeout(function () {
-            self.addRowsOnScroll(100);
-        }, 1000);
+        let cluster = this.getCluster(this.lastVisibleIndex);
+        if (cluster !== undefined)
+            this.lastVisibleIndex = cluster.index + cluster.rowspan - 1;
     },
-    umsatzChanged: function(e) {
-        $('#tax-button-DN').click();
-        selected_value = $('input[name="umsatz"]:checked').val();
-        if (selected_value === 'netto') {
-            $('#tax-button-DN')[0].innerHTML = '<span>Netto</span> <span class="caret"></span>';
-            this.currentUmsatz = 'netto';
-            var elementsToShow = document.getElementsByClassName('revenueLine');
-            var elementsToHide = document.getElementsByClassName('revenueLineBruttoUmsatz');
-            _.each(elementsToShow, function (row) {
-                row.classList.remove("hided-content");
-            });
-            _.each(elementsToHide, function (row) {
-                row.classList.add("hided-content");
-            });
-        } else if (selected_value === 'brutto') {
-            $('#tax-button-DN')[0].innerHTML = '<span>Brutto</span> <span class="caret"></span>';
-            this.currentUmsatz = 'brutto';
-            var elementsToShow = document.getElementsByClassName('revenueLineBruttoUmsatz');
-            var elementsToHide = document.getElementsByClassName('revenueLine');
-            _.each(elementsToShow, function (row) {
-                row.classList.remove("hided-content");
-            });
-            _.each(elementsToHide, function (row) {
-                row.classList.add("hided-content");
-            });
-        }
-
-        var self = this;
-        var codeSetting = 'taxDn_' + e.target.getAttribute('id').substring(e.target.getAttribute('id').indexOf('-') + 1,e.target.getAttribute('id').indexOf('-', e.target.getAttribute('id').indexOf('-') + 1));
-        var target = 'taxDn_';
-        var value = 'true';
-        var elements = ['taxDn_netto',
-            'taxDn_brutto'];
-
-        disabledElementForSlowConnection();
-
-        App.api.user.changeSetting.put(target, codeSetting, value).then(function (resp) {
-            var setting_value = resp.toString();
-            var settings = _.clone(App.instance.thisUser.get('setting'));
-
-            _.map(elements, function(element) {
-                if (element in settings) {
-                    return settings[element] = 'false';
-                }
-            });
-
-            if (settings) {
-                if (codeSetting in settings) {
-                    settings[codeSetting] = setting_value;
-                }
-            } else {
-                settings = [];
-                settings[codeSetting] = setting_value;
-            }
-            App.instance.thisUser.set('setting', settings);
-
-            includedElementForSlowConnection();
-        });
+    setData: function (noChangeLastVisibleIndex) {
+        this.setSorted();
+        this.setRenderingData(noChangeLastVisibleIndex);
     },
-    findDnRowsForChangeStatus: function (table_data, checked_buyer_id) {
-        var delivery_notes_change_state = [];
+    setRenderingData: function (noChangeLastVisibleIndex) {
+        this.filteredDataSortedClustered = this.setCluster();
 
-        table_data.forEach(function (data_row) {
-            if (data_row.CustomerId !== checked_buyer_id && rowDnMayBeSelect(data_row)) {
-                delivery_notes_change_state.push(Number(data_row.Id));
-            }
-        });
-        var table_rows = this.$el.find('#delivery-notes-table tr');
-        var document_id;
-        var table_rows_change_state = [];
-
-        _.each(table_rows, function (row) {
-            document_id = null;
-            if (!$(row).hasClass('selected')) {
-                document_id = $(row).find('a[data-target="#delivery-note-modal"]').data('id');
-            }
-            if (document_id !== null && $.inArray(Number(document_id), delivery_notes_change_state) > -1) {
-                table_rows_change_state.push(row);
-            }
-        });
-
-        return table_rows_change_state;
+        this.visibleData = this.setVisibleData(undefined, noChangeLastVisibleIndex);
     },
-    getAllSelectedDeliveryNotes: function () {
-        return this.$el.find('#delivery-notes-table').bootstrapTable('getAllSelections');
-    },
-    render: function () {
-        var $makeBillsButton = this.$el.closest('#delivery-note-list-modal').find('#make-bills-button');
-        var $makeFinalizeButton = this.$el.closest('#delivery-note-list-modal').find('#finalize-all-delivery-note-button');
-        var $deleteSelectedButton = this.$el.closest('#delivery-note-list-modal').find('#delete-selected-delivery-note-button');
-        var $makePageUp = this.$el.closest('#delivery-note-list-modal').find('.page-up-dn');
-        var $makePageDown = this.$el.closest('#delivery-note-list-modal').find('.page-down-dn');
-        var self = this;
-        var data = this.notes.toJSON();
-        var todaySum = 0.0; //heute
-        var todayMarAbs = 0.0;
-        var todayMwst = 0.0;
-        var thisWeekSum = 0.0; //diese Woche
-        var thisWeekMarAbs = 0.0;
-        var thisWeekMwst = 0.0;
-        var thisMonthSum = 0.0; //diesen Monat
-        var thisMonthMarAbs = 0.0;
-        var thisMonthMwst = 0.0;
-        var thisYearSum = 0.0; //dieses Jahr
-        var thisYearMarAbs = 0.0;
-        var thisYearMwst = 0.0;
-        var documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor;
-        documentTextColor = todayTextColor = thisWeekTextColor = thisMonthTextColor = thisYearTextColor = '';
+    renderTable: function () {
+        let self = this;
+        let $table = this.getTable();
+        $table.bootstrapTable({
+            data: this.visibleData,
 
-        var dataForTopTable = this.recalculateTopTable(data);
-
-        todaySum = dataForTopTable.todaySum;
-        todayMarAbs = dataForTopTable.todayMarAbs;
-        todayMwst = dataForTopTable.todayMwst;
-        thisWeekSum = dataForTopTable.thisWeekSum;
-        thisWeekMarAbs = dataForTopTable.thisWeekMarAbs;
-        thisWeekMwst = dataForTopTable.thisWeekMwst;
-        thisMonthSum = dataForTopTable.thisMonthSum;
-        thisMonthMarAbs = dataForTopTable.thisMonthMarAbs;
-        thisMonthMwst = dataForTopTable.thisMonthMwst;
-        thisYearSum = dataForTopTable.thisYearSum;
-        thisYearMarAbs = dataForTopTable.thisYearMarAbs;
-        thisYearMwst = dataForTopTable.thisYearMwst;
-        documentTextColor = dataForTopTable.documentTextColor;
-        todayTextColor = dataForTopTable.todayTextColor;
-        thisWeekTextColor = dataForTopTable.thisWeekTextColor;
-        thisMonthTextColor = dataForTopTable.thisMonthTextColor;
-        thisYearTextColor = dataForTopTable.thisYearTextColor;
-
-        dataForTopTable.dataTop.forEach(function (value) {
-            var productTotalSum = value.SumTotalPrice;
-            var revenueString = formatProfitForPrint(productTotalSum);
-            var valueTax = 0.0;
-            value.Products.forEach(function (item) {
-                valueTax += item.TotalTax;
-            });
-            var productTotalSumWithTax = productTotalSum + valueTax;
-            var revenueBruttoString = formatProfitForPrint(productTotalSumWithTax);
-            if (revenueString === '-') {
-                value.revenue = '-';
-            } else {
-                var revenueInvoice = 0;
-
-                if (App.instance.invoices) {
-                    var invoice_id = value.InvoiceId;
-                    if (invoice_id !== null) {
-
-                        var Invoices_collection = App.instance.invoices;
-                        var invoice = Invoices_collection.get(invoice_id);
-
-                        if(invoice != undefined) {
-                            revenueInvoice = typeof invoice.get('SumTotalPrice') !== 'undefined' ? invoice.get('SumTotalPrice') : null;
-                            revenueInvoice = ' \u20AC ' + formatProfitForPrint(revenueInvoice);
-                        }
-                    } else {
-                        revenueInvoice = '-';
-                    }
-                }
-                documentTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount);
-
-                var nettoHidedClass = self.currentUmsatz === 'netto' ? '' : ' hided-content';
-                var bruttoHidedClass = self.currentUmsatz === 'brutto' ? '' : ' hided-content';
-                value.revenue = '<div class="revenueLine' + nettoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueString + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>' +
-                    '<div class="revenueLineBruttoUmsatz' + bruttoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueBruttoString + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>';
-            }
-            // value.DeliveryNoteNumber = value.DeliveryNoteNumber + " (" + value.Company + ")";
-        });
-        var showArrowsSummary;
-        if(typeof App.instance.thisUser.get('setting') !== 'undefined'){
-            showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-        }else{
-            showArrowsSummary = 'true';
-        }
-        var newData = data.map(function (item) {
-            item.showArrowsSummary = showArrowsSummary;
-            item.deleted = false;
-            if (item.DeleteTimestamp !== '0000-00-00 00:00:00') {
-                var createDate = Date.parse(item.CreateTimestamp);
-                var deleteDate = Date.parse(item.DeleteTimestamp);
-                if (createDate < deleteDate) {
-                    item.deleted = true;
-                }
-            }
-            return item;
-        });
-        newData = $.grep(newData, function(item){
-            return item.deleted !== true;
-        });
-
-        if (sortOrderForTableDN() == 'desc') {
-            var reverseNewData = newData.slice().reverse();
-            this.paginationNewData = reverseNewData.slice(length - 30);
-        } else {
-            this.paginationNewData = newData.slice(length - 30);
-        }
-
-        this.processedData = this.paginationNewData;
-        this.currentData = this.paginationNewData;
-        this.$el.html(this.template());
-        $makeBillsButton.prop('disabled', true);
-        $makeFinalizeButton.prop('disabled', true);
-        $deleteSelectedButton.prop('disabled', true);
-
-        var delivery_notes_table = this.$el.find('#delivery-notes-table');
-        delivery_notes_table.bootstrapTable({
-            data: this.paginationNewData,
             filterControl: true,
-            toolbarAlign: 'none',
-            toolbar: '#toolbar-delivery-note-table', //Column order is important for custom toolbar
-            showColumns: true,
             classes: 'table table-hover medium-font',
             sortable: false,
-            paginationLoop: true,
-            checkboxHeader: true,
+            checkboxHeader: false,
             columns: [
                 {
                     formatter: indexFormatter,
                     class: 'position-column text-left wo-padding'
                 },
                 {
-                    field: 'state',
-                    checkbox: true,
-                    formatter: stateDnFormatter
+                    class: 'bst-checkbox',
+                    formatter: documentListCheckbox
                 },
                 {
                     field: 'DeliveryNoteNumber',
-                    formatter: linkFormatter,
+                    formatter: DNListDocumentNumberFormatter,
                     title: 'Lieferschein Nr',
-                    sortable: true,
-                    order: 'desc',
-                    filterControl: 'input',
-                    class: 'item-row'
+                    class: 'sortable item-row'
                 },
                 {
                     field: 'OrderCreateTimestamp',
-                    visible: visibleColumnItemOrderCreateTimestamp(),
                     formatter: dateFormatter,
-                    filterControl: 'datepicker',
-                    filterDatepickerOptions: {
-                        format: 'dd.mm.yyyy',
-                        autoclose: true,
-                        clearBtn: true,
-                        todayHighlight: true
-                    },
-                    id: 'dnOrderCreateTimestamp',
-                    class: 'table-th-datepicker-block',
-                    sortable: true,
-                    order: 'desc',
+                    class: 'table-th-datepicker-block sortable',
                     title: 'Eingegangene <br/> Bestellung',
                     width: '115px'
                 },
                 {
                     field: 'ModifyTimestamp',
-                    visible: visibleColumnItemModifyTimestamp(),
                     formatter: dateFormatter,
-                    filterControl: 'datepicker',
-                    filterDatepickerOptions: {
-                        format: 'dd.mm.yyyy',
-                        autoclose: true,
-                        clearBtn: true,
-                        todayHighlight: true
-                    },
-                    id: 'LetzteBearbeitungLieferschein',
-                    class: 'table-th-datepicker-block',
-                    sortable: true,
-                    order: 'desc',
+                    class: 'table-th-datepicker-block sortable',
                     title: 'Letzte <br/> Bearbeitung <br/> Lieferschein',
                     width: '115px'
                 },
                 {
                     field: 'CompletedTimestamp',
-                    visible: visibleColumnItemCompletedTimestamp(),
-                    formatter: dateFormatterCompleted,
-                    filterControl: 'datepicker',
-                    filterDatepickerOptions: {
-                        format: 'dd.mm.yyyy',
-                        autoclose: true,
-                        clearBtn: true,
-                        todayHighlight: true
-                    },
-                    id: 'Finalisiert',
-                    class: 'table-th-datepicker-block',
-                    sortable: true,
-                    order: 'desc',
+                    formatter: dateFormatter,
+                    class: 'table-th-datepicker-block sortable',
                     title: 'Finalisiert',
                     width: '115px'
                 },
                 {
                     field: 'FormattedStatus',
-                    id: 'notSorting',
-                    sortable: false,
-                    formatter: statusFormatter,
-                    filterControl: 'select',
-                    class: 'table-th-datepicker-block',
+                    formatter: documentStatusFormatter,
                     title: 'Status',
                     width: '120px'
                 },
                 {
                     field: 'InvoiceNumber',
-                    formatter: linkFormatterDeliveryInvoice,
+                    formatter: DNlinkFormatterInvoice,
                     title: 'Rechnung erstellt <br/> aus Lieferschein Nr',
-                    sortable: true,
-                    order: 'desc',
-                    class: 'item-row'
+                    class: 'sortable item-row'
                 },
                 {
-                    field: 'InvoiceNumberForStatus',
-                    id: 'notSorting',
-                    sortable: false,
-                    formatter: secondStatusFormatter,
-                    filterControl: 'select',
-                    class: 'table-th-datepicker-block',
+                    field: 'InvoiceStatusFormatted',
+                    formatter: DNListInvoiceStatusFormatter,
                     title: 'Status Rechnung',
                     width: '120px'
                 },
                 {
                     field: 'revenue',
-                    title: 'Umsatz / % Marge / <br/> abs Marge / Rechnung Umsatz',
-                    sortable: true,
-                    order: 'desc',
-                    class: 'item-row'
+                    formatter: DNgetRevenueFormatter,
+                    title: 'Umsatz / % Marge / <br/> absolut / Rechnung Umsatz',
+                    class: 'sortable item-row',
                 }
             ],
             locale: 'de-DE',
-            onPostBody: function(){
-                var countDocuments;
-                if ($('#delivery-notes-table')[0].rows[1].classList[0] == 'no-records-found') {
-                    countDocuments = 0;
-                } else {
-                    countDocuments = $('#delivery-notes-table')[0].rows.length -1;
-                }
-                changeCountDocument(countDocuments, newData.length);
-
-                var selected_DNs = self.getAllSelectedDeliveryNotes();
-                changeCheckedDocument(selected_DNs.length);
-
-                if (periodForTableDN() != '#all-group-delivery'){
-                    self.processedData = self.notes.toJSON();
-                }
-
-                if ($('#delivery-notes-scroll-listener').get(0).scrollHeight == $('#delivery-notes-scroll-listener').get(0).offsetHeight) {
-                    $makePageDown.attr('disabled', 'disabled');
-                    $makePageDown.addClass('arrowVisible');
-                    $makePageUp.attr('disabled', 'disabled');
-                    $makePageUp.addClass('arrowVisible');
-                }
-                if (countDocuments > 7) {
-                    $makePageDown.removeAttr('disabled');
-                    $makePageDown.removeClass('arrowVisible');
-                }
+            formatNoMatches: function () {
+                return "Keine passenden Ergebnisse gefunden.";
             },
-            onCheck: function (row) {
-                $makeBillsButton.prop('disabled', false);
-                $makeFinalizeButton.prop('disabled', false);
-                $deleteSelectedButton.prop('disabled', false);
-
-                var selected_DNs = self.getAllSelectedDeliveryNotes();
-
-                changeCheckedDocument(selected_DNs.length);
-
-                if (selected_DNs.length > 1) {
-                    firstCustomer = selected_DNs[0].CustomerId;
-                    _.each(selected_DNs, function (selected_DN) {
-                        if (selected_DN.CustomerId !== firstCustomer) {
-                            $makeBillsButton.prop('disabled', true);
-                        }
-                        if (selected_DN.Products.length === 0) {
-                            $makeBillsButton.prop('disabled', true);
-                        }
-                    });
-                }
-                else
-                {
-                    if (selected_DNs.length === 1) {
-                        if (selected_DNs[0].Products.length === 0) {
-                            $makeBillsButton.prop('disabled', true);
-                        }
-                    }
-                }
-
-                if (selected_DNs.length > 0) {
-                    $deleteSelectedButton.prop('disabled', false);
-                }
-
-                // temporary turned off
-                //if (selected_DNs.length > 1) {
-                //    return false;
-                //}
-                //var checked_buyer_id = row.CustomerId;
-                //
-                //var table_rows_change_state = self.findDnRowsForChangeStatus(self.paginationNewData, checked_buyer_id);
-                //
-                //_.each(table_rows_change_state, function (row_to_change) {
-                //    $(row_to_change).find('input[type="checkbox"]').prop('disabled', true);
-                //});
+            onPreBody: function () {
+                self.hiddenTable();
+                self.removeExcessElements();
             },
-            onCheckAll: function (rows) {
-                if (rows.length > 0) {
-                    $makeBillsButton.prop('disabled', false);
-                    $makeFinalizeButton.prop('disabled', false);
-                    $deleteSelectedButton.prop('disabled', false);
+            onPostBody: function () {
+                self.changeCountsDocument();
+                self.changeCheckedDocument(0);
 
-                    var selected_DNs = self.getAllSelectedDeliveryNotes();
+                setTimeout(() => {
+                    self.renderLastClickedLink();
 
-                    changeCheckedDocument(selected_DNs.length);
+                    self.tableRenderHelper();
 
-                    if (selected_DNs.length > 1) {
-                        firstCustomer = selected_DNs[0].CustomerId;
-                        _.each(selected_DNs, function (selected_DN) {
-                            if (selected_DN.CustomerId !== firstCustomer) {
-                                $makeBillsButton.prop('disabled', true);
-                            }
-                            if (selected_DN.Products.length === 0) {
-                                $makeBillsButton.prop('disabled', true);
-                            }
-                        });
-                    }
-                    else
-                    {
-                        if (selected_DNs.length === 1) {
-                            if (selected_DNs[0].Products.length === 0) {
-                                $makeBillsButton.prop('disabled', true);
-                            }
-                        }
-                    }
-                }
-            },
-            onUncheck: function (row) {
-                var selected_DNs = self.getAllSelectedDeliveryNotes();
-                changeCheckedDocument(selected_DNs.length);
-                $deleteSelectedButton.prop('disabled', false);
+                    self.renderClusters();
+                    self.renderHideColumn();
 
-                if (selected_DNs.length === 0) {
-                    $makeBillsButton.prop('disabled', true);
-                    $makeFinalizeButton.prop('disabled', true);
-                    $deleteSelectedButton.prop('disabled', true);
-                }
-
-                if (selected_DNs.length > 1) {
-                    firstCustomer = selected_DNs[0].CustomerId;
-                    var differentCustomers = false;
-                    var emptyProducts = false;
-                    _.each(selected_DNs, function (selected_DN) {
-                        if (selected_DN.CustomerId !== firstCustomer) {
-                            differentCustomers = true;
-                        }
-                        if (selected_DN.Products.length === 0) {
-                            emptyProducts = true;
-                        }
-                    });
-                    if (differentCustomers === true || emptyProducts === true) {
-                        $makeBillsButton.prop('disabled', true);
-                    } else {
-                        $makeBillsButton.prop('disabled', false);
-                    }
-                }
-                else
-                {
-                    if (selected_DNs.length === 1) {
-                        if (selected_DNs[0].Products.length === 0) {
-                            $makeBillsButton.prop('disabled', true);
-                        }
-                        else
-                        {
-                            $makeBillsButton.prop('disabled', false);
-                        }
-                    }
-                }
-            },
-            onUncheckAll: function () {
-                var selected_DNs = self.getAllSelectedDeliveryNotes();
-                changeCheckedDocument(selected_DNs.length);
-                $makeBillsButton.prop('disabled', true);
-                $makeFinalizeButton.prop('disabled', true);
-                $deleteSelectedButton.prop('disabled', true);
-            },
-            onSearch: function () {
-                var dataForTopTable = self.recalculateTopTable($('#delivery-notes-table').bootstrapTable('getData'));
-
-                var todaySum = dataForTopTable.todaySum;
-                var todayMarAbs = dataForTopTable.todayMarAbs;
-                var todayMwst = dataForTopTable.todayMwst;
-                var thisWeekSum = dataForTopTable.thisWeekSum;
-                var thisWeekMarAbs = dataForTopTable.thisWeekMarAbs;
-                var thisWeekMwst = dataForTopTable.thisWeekMwst;
-                var thisMonthSum = dataForTopTable.thisMonthSum;
-                var thisMonthMarAbs = dataForTopTable.thisMonthMarAbs;
-                var thisMonthMwst = dataForTopTable.thisMonthMwst;
-                var thisYearSum = dataForTopTable.thisYearSum;
-                var thisYearMarAbs = dataForTopTable.thisYearMarAbs;
-                var thisYearMwst = dataForTopTable.thisYearMwst;
-                var documentTextColor = dataForTopTable.documentTextColor;
-                var todayTextColor = dataForTopTable.todayTextColor;
-                var thisWeekTextColor = dataForTopTable.thisWeekTextColor;
-                var thisMonthTextColor = dataForTopTable.thisMonthTextColor;
-                var thisYearTextColor = dataForTopTable.thisYearTextColor;
-
-                dataForTopTable.dataTop.forEach(function (value) {
-                    var productTotalSum = value.SumTotalPrice;
-                    var revenueString = formatProfitForPrint(productTotalSum);
-                    var valueTax = 0.0;
-                    value.Products.forEach(function (item) {
-                        valueTax += item.TotalTax;
-                    });
-                    var productTotalSumWithTax = productTotalSum + valueTax;
-                    var revenueBruttoString = formatProfitForPrint(productTotalSumWithTax);
-                    if (revenueString === '-') {
-                        value.revenue = '-';
-                    } else {
-                        var revenueInvoice = 0;
-
-                        if (App.instance.invoices) {
-                            var invoice_id = value.InvoiceId;
-                            if (invoice_id !== null) {
-
-                                var Invoices_collection = App.instance.invoices;
-                                var invoice = Invoices_collection.get(invoice_id);
-
-                                if(invoice != undefined) {
-                                    revenueInvoice = typeof invoice.get('SumTotalPrice') !== 'undefined' ? invoice.get('SumTotalPrice') : null;
-                                    revenueInvoice = ' \u20AC ' + formatProfitForPrint(revenueInvoice);
-                                }
-                            } else {
-                                revenueInvoice = '-';
-                            }
-                        }
-                        documentTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount);
-
-                        var nettoHidedClass = self.currentUmsatz === 'netto' ? '' : ' hided-content';
-                        var bruttoHidedClass = self.currentUmsatz === 'brutto' ? '' : ' hided-content';
-                        value.revenue = '<div class="revenueLine' + nettoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueString + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>' +
-                            '<div class="revenueLineBruttoUmsatz' + bruttoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueBruttoString + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                            '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>';
-                    }
-                    // value.DeliveryNoteNumber = value.DeliveryNoteNumber + " (" + value.Company + ")";
-                });
-
-                self.renderTopTable(todaySum, todayMarAbs, todayMwst, thisWeekSum, thisWeekMarAbs, thisWeekMwst, thisMonthSum, thisMonthMarAbs, thisMonthMwst,
-                    thisYearSum, thisYearMarAbs, thisYearMwst, documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor);
-
-                if (self.currentUmsatz === 'brutto') {
-                    var elementsToShow = document.getElementsByClassName('revenueLineBruttoUmsatz');
-                    var elementsToHide = document.getElementsByClassName('revenueLine');
-                    _.each(elementsToShow, function (row) {
-                        row.classList.remove("hided-content");
-                    });
-                    _.each(elementsToHide, function (row) {
-                        row.classList.add("hided-content");
-                    });
-                }
-            },
-            onAll: function () {
-                if (self.DeliveryNoteNumberColSort === 'no' && self.OrderCreateTimestampColSort === 'no' &&
-                    self.ModifyTimestampColSort === 'no' && self.CompletedTimestampColSort === 'no' &&
-                    self.FormattedStatusColSort === 'no' && self.InvoiceNumberColSort === 'no' &&
-                    self.revenueColSort === 'no' && self.InvoiceNumberForStatusColSort === 'no') {
-                    var sortName = sortNameForTableDN();
-                    var sortOrder = sortOrderForTableDN();
-
-                    self.DeliveryNoteNumberColSort = sortName === 'DeliveryNoteNumber' ? sortOrder : 'no';
-                    self.OrderCreateTimestampColSort = sortName === 'OrderCreateTimestamp' ? sortOrder : 'no';
-                    self.ModifyTimestampColSort = sortName === 'ModifyTimestamp' ? sortOrder : 'no';
-                    self.CompletedTimestampColSort = sortName === 'CompletedTimestamp' ? sortOrder : 'no';
-                    self.FormattedStatusColSort = sortName === 'FormattedStatus' ? sortOrder : 'no';
-                    self.InvoiceNumberColSort = sortName === 'InvoiceNumber' ? sortOrder : 'no';
-                    self.revenueColSort = sortName === 'revenue' ? sortOrder : 'no';
-                    self.InvoiceNumberForStatusColSort = sortName === 'InvoiceNumberForStatus' ? sortOrder : 'no';
-                }
+                    self.setHandlers();
+                    self.showTable();
+                    self.changeNavigateButton();
+                }, 0);
             }
         });
+    },
+    changeDisableButton: function (_arguments) {
+        if (_arguments !== undefined && _arguments.countDocument > 0) {
+            this.$buttonCopyDN.prop('disabled', _arguments.emptyProducts);
 
-        this.renderTopTable(todaySum, todayMarAbs, todayMwst, thisWeekSum, thisWeekMarAbs, thisWeekMwst, thisMonthSum, thisMonthMarAbs, thisMonthMwst,
-            thisYearSum, thisYearMarAbs, thisYearMwst, documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor);
+            this.$buttonDeleteSelected.prop('disabled', false);
+            this.$buttonFinalize.prop('disabled', ( _arguments.allFinalizedCanceled || _arguments.emptyProducts));
 
-        this.tableSwitchFilterHelper(self.$el);
-        //this.$el.find('#delivery-notes-table').bootstrapTable('filterBy', ''); // need for correct merging because of strange table rendering
-        $makeBillsButton.off('click').on('click', function () {
-            var text = 'Lieferschein finalisieren und Rechnung vorbereiten?';
-            Matrex.confirm(text, function () {
-                var Dn = self.getAllSelectedDeliveryNotes();
-                var DnId = Dn.map(function (item) {
-                    return item.Id
-                });
-                App.instance.invoices.fetch({
-                    type: 'POST',
-                    data: {deliveryNoteId: DnId.join()},
-                    success: function () {
-                        App.instance.invoices.fetch({
-                            error: function (model, response, options) {
-                                displayErrorBackbone(model, response, options);
-                            }
-                        });
-                        App.instance.deliveryNotes.fetch({
-                            error: function (model, response, options) {
-                                displayErrorBackbone(model, response, options);
-                            }
-                        });
-                        Matrex.notify('Rechnung wurde erstellt.', 'success');
-                        self.$el.find('#delivery-notes-table').bootstrapTable('uncheckAll');
-                    },
-                    error: function (model, response, options) {
-                        displayErrorBackbone(model, response, options);
-                    }
-                });
-            }, function () {
-            });
-        });
-        $makeFinalizeButton.off('click').on('click', function () {
-            var Dn = self.getAllSelectedDeliveryNotes();
-            var DnId = Dn.map(function (item) {
-                return item.Id
-            });
-            App.instance.deliveryNotes.fetch({
-                type: 'PATCH',
-                data: {
-                    Finalize: true,
-                    DeliveryNoteIds: DnId
-                },
-                success: function () {
-                    Matrex.notify('Lieferschein wurde abgeschlossen.', 'success');
-                    self.$el.find('#delivery-notes-table').bootstrapTable('uncheckAll');
-                },
-                error: function (model, response, options) {
-                    Matrex.notify(response.responseJSON.message, 'error');
-                }
-            })
-        });
-        $deleteSelectedButton.off('click').on('click', function () {
-            var text = 'Ausgewählte Lieferscheinen löschen?';
-            Matrex.confirm(text, function () {
-                disabledElementForSlowConnection();
-                var Dn = self.getAllSelectedDeliveryNotes();
-                var delBills = document.getElementById('delete-with-bill').checked;
-                var DnId = Dn.map(function (item) {
-                    return item.Id
-                });
-                var InvId = Dn.map(function (item) {
-                    return item.InvoiceId
-                });
-                InvId = InvId.filter(function (el) {
-                    return el != null;
-                });
-                App.instance.deliveryNotes.fetch({
-                    type: 'DELETE',
-                    reset: true,
-                    data: {
-                        Delete: true,
-                        DeliveryNoteIds: DnId,
-                        DeleteBills: delBills,
-                        InvoiceIds: InvId
-                    },
-                    success: function () {
-                        var notesData = self.notes.models.map(function (item) {
-                            item.attributes.deleted = false;
-                            if (item.attributes.DeleteTimestamp !== '0000-00-00 00:00:00') {
-                                var createDate = Date.parse(item.attributes.CreateTimestamp);
-                                var deleteDate = Date.parse(item.attributes.DeleteTimestamp);
-                                if (createDate < deleteDate) {
-                                    item.attributes.deleted = true;
-                                }
-                            }
-                            return item;
-                        });
-                        notesData = $.grep(notesData, function(item){
-                            return item.attributes.deleted !== true;
-                        });
-                        if (delBills) {
-                            notesData.forEach(function (value) {
-                                if (InvId.includes(value.attributes.InvoiceId)) {
-                                    value.attributes.InvoiceId = null;
-                                    value.attributes.InvoiceNumber = null;
-                                    value.attributes.InvoiceNumberForStatus = null;
-                                    value.attributes.InvoiceStatus = null;
-                                    value.attributes.InvoiceTitle = null;
-                                }
-                            });
-                        }
-                        self.notes.models = notesData;
-                        self.calculedNotes = self.notes.toJSON();
-                        self.render();
-                        setTimeout(function () {
-                            self.addRowsOnScroll(100);
-                        }, 1000);
-                        App.instance.invoices.fetch({
-                            reset: true,
-                            error: function (model, response, options) {
-                                displayErrorBackbone(model, response, options);
-                            },
-                            success: function () {
-                                App.instance.invoices.forEach(function (value) {
-                                    if (value.attributes.sourceDeliveryNotes != null) {
-                                        value.attributes.sourceDeliveryNotes.forEach(function (valueDn) {
-                                            valueDn.deleted = false;
-                                            if (DnId.includes(valueDn.Id)) {
-                                                valueDn.deleted = true;
-                                            }
-                                        });
-                                        value.attributes.sourceDeliveryNotes = $.grep(value.attributes.sourceDeliveryNotes, function(item){
-                                            return item.deleted !== true;
-                                        });
-                                    }
-                                });
-                            }
-                        });
-                        includedElementForSlowConnection();
-                        Matrex.notify('Lieferscheinen wurden entfernt.', 'success');
-                        self.$el.find('#delivery-notes-table').bootstrapTable('uncheckAll');
-                    },
-                    error: function (model, response, options) {
-                        includedElementForSlowConnection();
-                        Matrex.notify(response.responseJSON.message, 'error');
-                    }
-                })
-            }, function () {
-            });
-        });
-
-        var scHeight = $('#delivery-notes-scroll-listener').get(0).scrollHeight;
-        var clHeight = $('#delivery-notes-scroll-listener').get(0).clientHeight;
-        var scTop = $('#delivery-notes-scroll-listener').scrollTop();
-        $('html').keydown(function(e){
-            scHeight = $('#delivery-notes-scroll-listener').get(0).scrollHeight;
-            clHeight = $('#delivery-notes-scroll-listener').get(0).clientHeight;
-            scTop = $('#delivery-notes-scroll-listener').scrollTop();
-
-            if (e.which == 40 || e.which == 98) {
-                $makePageUp.removeAttr('disabled');
-                $makePageUp.removeClass('arrowVisible');
-
-                $('#delivery-notes-scroll-listener').scrollTop(scTop + clHeight);
-
-                if (scHeight <= clHeight + scTop) {
-                    $makePageDown.attr('disabled', 'disabled');
-                    $makePageDown.addClass('arrowVisible');
-                }
+            let IsDisabledMakeBills = false;
+            switch (true) {
+                case  _arguments.differentCustomers:
+                    IsDisabledMakeBills = true;
+                    break;
+                case  _arguments.allHasBillCanceled:
+                    IsDisabledMakeBills = true;
+                    break;
+                case  _arguments.emptyProducts:
+                    IsDisabledMakeBills = true;
+                    break;
+                case _arguments.hasCanceled:
+                    IsDisabledMakeBills = true;
+                    break;
             }
-            if (e.which == 38 || e.which == 104) {
-                $makePageDown.removeAttr('disabled');
-                $makePageDown.removeClass('arrowVisible');
+            this.$buttonMakeBills.prop('disabled', IsDisabledMakeBills);
 
-                $('#delivery-notes-scroll-listener').scrollTop(scTop - clHeight);
-
-                if ($('#delivery-notes-scroll-listener').scrollTop() == 0) {
-                    $makePageUp.attr('disabled', 'disabled');
-                    $makePageUp.addClass('arrowVisible');
-                }
+            if ( _arguments.emptyProducts ||  _arguments.hasBill ||  _arguments.hasFinalized || _arguments.hasCanceled) {
+                this.$buttonCutDN.prop('disabled', true);
+            } else {
+                this.$buttonCutDN.prop('disabled', false);
             }
-        });
-
-        $('#open-invoices').one('click', function () {
-            var headerTemplate = _.template($('#company-address-tpl').html());
-            $('#invoices-header').empty();
-            $('#invoices-header').html(headerTemplate(
-                _.extend({
-                    companyName: 'Alle Kunden',
-                    address: '',
-                })
-            ));
-            formatCommaText($('#invoices-header'));
-            var item = new CustomerInvoicesView(self.invoices, self.notes, 0);
-            item.render();
-            setTimeout(function () {
-                item.addRowsOnScroll(100);
-            }, 1000);
-        });
-
-        var status = $('.bootstrap-table-filter-control-FormattedStatus');
-        var statusRechnung = $('.bootstrap-table-filter-control-InvoiceNumberForStatus');
-        status.on('click', function (e) {
-            if ($(status).val() != '') {
-                statusRechnung.val('');
-                $(statusRechnung).trigger('change');
-            }
-        });
-        statusRechnung.on('click', function (e) {
-            if ($(statusRechnung).val() != '') {
-                status.val('');
-                $(status).trigger('change');
-            }
-        });
-
-        $makePageDown.on('click', function (e) {
-            scHeight = $('#delivery-notes-scroll-listener').get(0).scrollHeight;
-            clHeight = $('#delivery-notes-scroll-listener').get(0).clientHeight;
-            scTop = $('#delivery-notes-scroll-listener').scrollTop();
-
-            $makePageUp.removeAttr('disabled');
-            $makePageUp.removeClass('arrowVisible');
-
-            $('#delivery-notes-scroll-listener').scrollTop(scTop + clHeight);
-
-            if (scHeight <= clHeight + scTop) {
-                $makePageDown.attr('disabled', 'disabled');
-                $makePageDown.addClass('arrowVisible');
-            }
-        });
-        $makePageUp.on('click', function (e) {
-            scHeight = $('#delivery-notes-scroll-listener').get(0).scrollHeight;
-            clHeight = $('#delivery-notes-scroll-listener').get(0).clientHeight;
-            scTop = $('#delivery-notes-scroll-listener').scrollTop();
-
-            $makePageDown.removeAttr('disabled');
-            $makePageDown.removeClass('arrowVisible');
-
-            $('#delivery-notes-scroll-listener').scrollTop(scTop - clHeight);
-
-            if ($('#delivery-notes-scroll-listener').scrollTop() == 0) {
-                $makePageUp.attr('disabled', 'disabled');
-                $makePageUp.addClass('arrowVisible');
-            }
-        });
-
-        //this.tableSwitchFilterHelper(self.$el);
-        var cdn = this;
-        $('.add-column-menu').on('change', function () {
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-            cdn.drawSorts();
-        });
-
-        if (periodForTableDN() == '#today-group-delivery'){
-            $('#today-group-delivery').attr('checked', 'checked');
-            cdn.currentPeriod = 'today';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Heute</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-        } else if (periodForTableDN() == '#yesterday-group-delivery'){
-            $('#yesterday-group-delivery').attr('checked', 'checked');
-            cdn.currentPeriod = 'yesterday';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Gestern</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-        } else if (periodForTableDN() == '#week-group-delivery'){
-            $('#week-group-delivery').attr('checked', 'checked');
-            cdn.currentPeriod = 'week';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Diese Woche</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-        } else if (periodForTableDN() == '#sevendays-group-delivery'){
-            $('#sevendays-group-delivery').attr('checked', 'checked');
-            cdn.currentPeriod = 'sevendays';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Letzte Woche</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-        } else if (periodForTableDN() == '#month-group-delivery'){
-            $('#month-group-delivery').attr('checked', 'checked');
-            cdn.currentPeriod = 'month';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Dieser Monat</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-        } else if (periodForTableDN() == '#year-group-delivery'){
-            $('#year-group-delivery').attr('checked', 'checked');
-            cdn.currentPeriod = 'year';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Dieses Jahr</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-        } else if (periodForTableDN() == '#all-group-delivery'){
-            $('#all-group-delivery').attr('checked', 'checked');
-            cdn.currentPeriod = 'all';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Alle Lieferscheine</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
+            this.$buttonDownloadPdf.prop('disabled', !this.isAllSelectedDocumentFinalized(_arguments))
         } else {
-            $('#all-group-delivery').attr('checked', 'checked');
-            cdn.currentPeriod = 'all';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Alle Lieferscheine</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
+            this.$buttonCopyDN.prop('disabled', true);
+            this.$buttonCutDN.prop('disabled', true);
+            this.$buttonDeleteSelected.prop('disabled', true);
+            this.$buttonFinalize.prop('disabled', true);
+            this.$buttonMakeBills.prop('disabled', true);
+            this.$buttonDownloadPdf.prop('disabled', true);
+        }
+    },
+    getArgumentChangedButton: function (selected_DN, _arguments, firstCustomer) {
+        let result = _arguments;
+        result.allFinalizedCanceled = this.getAllFinalizedCanceled(_arguments, selected_DN.Status);
+        result.allHasBillCanceled = this.setAllHasBillCanceled(_arguments, selected_DN);
+        result.allHasBill = this.setAllHasBill(_arguments, selected_DN.InvoiceId);
+        result.hasBill = result.hasBill ? result.hasBill : selected_DN.InvoiceId !== null;
+        result.hasCanceled = result.hasCanceled ? result.hasCanceled : selected_DN.Status === 'Canceled';
+        result.hasFinalized = result.hasFinalized ? result.hasFinalized : selected_DN.Status === 'Completed';
+        result.hasInProcess = result.hasInProcess ? result.hasInProcess : selected_DN.Status === 'InProcess';
+        if (selected_DN.CustomerId !== firstCustomer)
+            result.differentCustomers = true;
+        if (selected_DN.Products.length === 0)
+            result.emptyProducts = true;
+
+        return result;
+    },
+    initializeAngumentChangedButton: function (countDocument) {
+        return {
+            countDocument: countDocument,
+            emptyProducts: false,
+            hasFinalized: false,
+            hasInProcess: false,
+            hasCanceled: false,
+            hasBill: false,
+            differentCustomers: false,
+            allHasBill: null,
+            allHasBillCanceled: null,
+            allFinalizedCanceled: null
+        };
+    },
+    changeTitleFooterButtons: function (_arguments) {
+        let different_customer_title = "Unterschiedliche kunden",
+            empty_order_title = "Keine produkte",
+            existed_bill_title = "Rechnung existiert",
+            allFinalized_title = "Alle Finalized",
+            hasFinalized_title = "Finalized",
+            allCanceled_title = "Alle Storno",
+            hasCanceled_title = "Storno",
+            notAllFinalised = "Nicht alles finalized";
+
+        this.setDefaultTitleButtons();
+
+        if(!this.isAllSelectedDocumentFinalized(_arguments)) {
+            let title_downloadPdfs = this.$buttonDownloadPdf.attr('title');
+            this.$buttonDownloadPdf.attr('title', title_downloadPdfs + " " + notAllFinalised);
         }
 
-        $('#today-group-delivery').off().on('click', function (e) {
-            rollCallDN(e);
-            cdn.currentPeriod = 'today';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Heute</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-            cdn.changePeriodSetting(e);
-            cdn.renderTax();
-        });
-        $('#yesterday-group-delivery').off().on('click', function (e) {
-            rollCallDN(e);
-            cdn.currentPeriod = 'yesterday';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Gestern</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-            cdn.changePeriodSetting(e);
-            cdn.renderTax();
-        });
-        $('#week-group-delivery').off().on('click', function (e) {
-            rollCallDN(e);
-            cdn.currentPeriod = 'week';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Diese Woche</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-            cdn.changePeriodSetting(e);
-            cdn.renderTax();
-        });
-        $('#sevendays-group-delivery').off().on('click', function (e) {
-            rollCallDN(e);
-            cdn.currentPeriod = 'sevendays';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Letzte Woche</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-            cdn.changePeriodSetting(e);
-            cdn.renderTax();
-        });
-        $('#month-group-delivery').off().on('click', function (e) {
-            rollCallDN(e);
-            cdn.currentPeriod = 'month';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Dieser Monat</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-            cdn.changePeriodSetting(e);
-            cdn.renderTax();
-        });
-        $('#year-group-delivery').off().on('click', function (e) {
-            rollCallDN(e);
-            cdn.currentPeriod = 'year';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Dieses Jahr</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-            cdn.changePeriodSetting(e);
-            cdn.renderTax();
-        });
-        $('#all-group-delivery').off().on('click', function (e) {
-            rollCallDN(e);
-            cdn.currentPeriod = 'all';
-            var periodButton = $('#date-group-dropdown-delivery');
-            periodButton[0].innerHTML = '<span>Alle Lieferscheine</span> <span class="caret"></span>';
-            var filteredData = cdn.filterPeriod(false);
-            var $table = $('#delivery-notes-table');
-            $table.bootstrapTable('load', filteredData);
-            cdn.setSorts();
-            if (cdn.clustered) {
-                cdn.clustering();
-                cdn.toCluster();
-            }
-            cdn.changePeriodSetting(e);
-            cdn.renderTax();
-        });
-        $('#deliveryNoteCluster').off().on('change', function (e) {
-            cdn.clustered = e.target.checked;
-            if (cdn.clustered) {
-                cdn.toCluster();
-            }
-            else
-            {
-                cdn.deCluster();
-            }
-            cdn.drawSorts();
-        });
-        cdn.setSorts();
-        cdn.clustering();
-        var checkedCluster = $(this.$el).find('#deliveryNoteCluster');
-        if (App.instance.thisUser.get('setting').deliveryNoteCluster == 'true'){
-            checkedCluster.attr("checked","checked");
-            cdn.toCluster();
-        } else {
-            checkedCluster.removeAttr("checked");
+        if (_arguments.allFinalizedCanceled) {
+            let title_allFinalized = this.$buttonFinalize.attr('title');
+            this.$buttonFinalize.attr('title', title_allFinalized + " " + allFinalized_title);
         }
-        cdn.drawSorts();
-        this.$el.find('.show-delivery-note').each(function () {
-            if (this.dataset.id == self.lastClicked) {
-                this.classList.add('last-clicked');
-            }
+
+        if(_arguments.hasCanceled) {
+            let title_makeBillsButton = this.$buttonMakeBills.attr('title');
+            this.$buttonMakeBills.attr('title', title_makeBillsButton + " " + hasCanceled_title);
+
+            let title_cutDNButton = this.$buttonCutDN.attr('title');
+            this.$buttonCutDN.attr('title', title_cutDNButton + " " + hasCanceled_title);
+        }
+        if (_arguments.allHasBill) {
+            let title_makeBillsButton = this.$buttonMakeBills.attr('title');
+            this.$buttonMakeBills.attr('title', title_makeBillsButton + " " + existed_bill_title);
+        }
+        if(_arguments.hasBill) {
+            let title_cutDNButton = this.$buttonCutDN.attr('title');
+            this.$buttonCutDN.attr('title', title_cutDNButton + " " + existed_bill_title);
+        }
+        if (_arguments.hasFinalized) {
+            let title_cutDNButton = this.$buttonCutDN.attr('title');
+            this.$buttonCutDN.attr('title', title_cutDNButton + " " + hasFinalized_title);
+        }
+
+        if (_arguments.differentCustomers) {
+            let title_makeBillsButton = this.$buttonMakeBills.attr('title');
+            this.$buttonMakeBills.attr('title', title_makeBillsButton + " " + different_customer_title);
+        }
+
+        if (_arguments.emptyProducts) {
+            let title_copyDNButton = this.$buttonCopyDN.attr('title');
+            this.$buttonCopyDN.attr('title', title_copyDNButton + " " + empty_order_title);
+
+            let title_makeBillsButton = this.$buttonMakeBills.attr('title');
+            this.$buttonMakeBills.attr('title', title_makeBillsButton + " " + empty_order_title);
+
+            let title_cutDNb = this.$buttonCutDN.attr('title');
+            this.$buttonCutDN.attr('title', title_cutDNb + " " + empty_order_title);
+
+            let title_allFinalized = this.$buttonFinalize.attr('title');
+            this.$buttonFinalize.attr('title', title_allFinalized + " " + empty_order_title);
+        }
+    },
+    hideClusterSetting: function () {
+        if (window.innerWidth <= 760)
+            this.$el.find('input#deliveryNoteCluster').closest('div.btn-group').addClass('hidden');
+    },
+    hideParentElements: function () {
+        this.$parent_el.find('#delivery-notes-header').add('#delivery-notes-content').addClass('hidden');
+        this.$spinner.removeClass('hidden');
+    },
+    showParentElements: function () {
+        this.$parent_el.find('#delivery-notes-header').add('#delivery-notes-content').removeClass('hidden');
+    },
+    render: function () {
+        this.$el.html(this.template());
+        this.hideParentElements();
+        setTimeout(() => {
+            this.renderToolbarSetting();
+            this.hideClusterSetting();
+            this.disableMainButton();
+            this.renderMainButton();
+            this.setDefaultTitleButtons();
+            this.showParentElements();
+            this.setAllData();
+            this.renderTopTableAfterFiltered();
+            this.renderTable();
+        }, 0);
+
+        let UserListDropMenuCopy = new CopyUserListDropMenuDocumentList();
+        UserListDropMenuCopy.render();
+        this.$parent_el.find('#copy-delivery-note-button').off().on('click', (e) => {
+            UserListDropMenuCopy.toggleDropDown();
         });
-        this.$el.find('.show-invoice').each(function () {
-            if (this.dataset.id == self.lastClickedInvoice) {
-                this.classList.add('last-clicked');
+        let UserListDropMenuCut = new CutUserListDropMenuDocumentList();
+        UserListDropMenuCut.render();
+        this.$parent_el.find('#cut-delivery-note-button').off().on('click', (e) => {
+            UserListDropMenuCut.toggleDropDown();
+        });
+
+        let $userListCopy = UserListDropMenuCopy.$el;
+        let $userListCut = UserListDropMenuCut.$el;
+        this.$parent_el.on('click', (e) => {
+            if (!$userListCopy.is(e.target) && $userListCopy.has(e.target).length === 0 && !this.$buttonCopyDN.is(e.target) && this.$buttonCopyDN.has(e.target).length === 0) {
+                $userListCopy.removeClass('open');
+            }
+            if (!$userListCut.is(e.target) && $userListCut.has(e.target).length === 0 && !this.$buttonCutDN.is(e.target) && this.$buttonCutDN.has(e.target).length === 0) {
+                $userListCut.removeClass('open');
             }
         });
 
-        this.renderTax();
-        if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-            showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-            if (showArrowsSummary == 'false') {
-                $('.arrowLineForTables i').css({'display': 'none'});
-                $('.arrowLineForTables span').css({'margin-left': '0'});
+        UserListDropMenuCopy.event.onSelected = (newDocument) => {
+            this.addNewDocumentsCollection(newDocument);
+        };
+        UserListDropMenuCut.event.onSelected = (removed_ids, newDocument) => {
+            let documents = this.getAllSelectedDocuments();
+            let invoiceIds = [];
+            _.each(documents, (_document) => {
+                if (_document.InvoiceId !== null && invoiceIds.indexOf(_document.InvoiceId) === -1)
+                    invoiceIds.push(_document.InvoiceId);
+            });
+            if (!this.isChangingDataBackendDelete()) {
+                this.removeDocumentsCollection(removed_ids);
+                this.addNewDocumentsCollection(newDocument);
+                this.fetchInvoices(invoiceIds);
+            } else {
+                this.disabledForm();
+                App.api.document.delivery_note.getAll().then(
+                    (documents) => {
+                        this.setCollectionsAfterFetch(documents);
+                        this.fetchInvoices(invoiceIds);
+                        this.enabledForm();
+                    },
+                    () => {
+                        this.enabledForm();
+                    }
+                );
             }
-        }
-
+        };
+        UserListDropMenuCopy.event.onSelect = (user_id) => {
+            $userListCopy.removeClass('open');
+            let document_ids = _.pluck(this.getAllSelectedDocuments(), 'Id');
+            if (document_ids.length > 0)
+                UserListDropMenuCopy.copyDocument(document_ids, user_id);
+        };
+        UserListDropMenuCut.event.onSelect = (user_id) => {
+            $userListCut.removeClass('open');
+            let document_ids = _.pluck(this.getAllSelectedDocuments(), 'Id');
+            if (document_ids.length > 0)
+                UserListDropMenuCut.cutDocument(document_ids, user_id);
+        };
         return this;
     },
-    renderTax: function() {
-        if (taxForTableDN() == '#umsatz-netto-radio') {
-            $('#umsatz-netto-radio-dn').attr('checked', 'checked');
-            $('#tax-button-DN')[0].innerHTML = '<span>Netto</span> <span class="caret"></span>';
-            this.currentUmsatz = 'netto';
-            var elementsToShow = document.getElementsByClassName('revenueLine');
-            var elementsToHide = document.getElementsByClassName('revenueLineBruttoUmsatz');
-            _.each(elementsToShow, function (row) {
-                row.classList.remove("hided-content");
-            });
-            _.each(elementsToHide, function (row) {
-                row.classList.add("hided-content");
-            });
-        } else if (taxForTableDN() == '#umsatz-brutto-radio') {
-            $('#umsatz-brutto-radio-dn').attr('checked', 'checked');
-            $('#tax-button-DN')[0].innerHTML = '<span>Brutto</span> <span class="caret"></span>';
-            this.currentUmsatz = 'brutto';
-            var elementsToShow = document.getElementsByClassName('revenueLineBruttoUmsatz');
-            var elementsToHide = document.getElementsByClassName('revenueLine');
-            _.each(elementsToShow, function (row) {
-                row.classList.remove("hided-content");
-            });
-            _.each(elementsToHide, function (row) {
-                row.classList.add("hided-content");
-            });
+    removeDocumentsCollection: function (removed_ids) {
+        if (!this.isEqualCollections()) {
+            App.instance.deliveryNotes.remove(removed_ids);
+            this.notes.remove(removed_ids);
+        } else this.notes.remove(removed_ids);
+    },
+    addNewDocumentsCollection: function (documents) {
+        let Models = [];
+        _.each(documents, _document => {
+            Models.push(new DeliveryNote(_document, {parse: true}));
+        });
+        if (!this.isEqualCollections()) {
+            App.instance.deliveryNotes.add(Models);
+            this.notes.add(_.filter(Models, model => {
+                return model.get('CustomerId') === this.customerId;
+            }));
+        } else this.notes.add(Models);
+    },
+    isChangingDataBackendDelete: function () {
+        return this.wasRenameDeletedDocuments() || this.wasDeleteBill();
+    },
+    wasDeleteBill: function () {
+        return App.instance.thisUser.getSetting('deleteDnWithInvoice') === 'true';
+    },
+    getPeriod: function () {
+        return App.instance.thisUser.getSetting('periodDNList');
+    },
+    getDateNameSorted: function (sortName) {
+        let availableColumns = ['OrderCreateTimestamp', 'ModifyTimestamp', 'CompletedTimestamp'];
+        if (sortName === undefined)
+            sortName = this.getSortName();
+
+        let result = availableColumns.indexOf(sortName) !== -1 ? sortName : 'OrderCreateTimestamp';
+
+        return result;
+    },
+    setSelectOptionContraDocumentStatus: function (_document) {
+        if (_document.InvoiceStatusFormatted !== null && this.optionsStatusContraDocument.indexOf(_document.InvoiceStatusFormatted) === -1)
+            this.optionsStatusContraDocument.push(_document.InvoiceStatusFormatted);
+    },
+    getFieldsInputAvailable: function () {
+        return [
+            'DeliveryNoteNumber',
+            'OrderCreateTimestamp',
+            'ModifyTimestamp',
+            'CompletedTimestamp',
+            'InvoiceNumber'
+        ]
+    },
+    getFilteredData: function (documents) {
+        if (documents === undefined) {
+            if (this.notes.size == 0) {
+                documents = [];
+            } else {
+                documents = this.notes.toJSON();
+            }
+        }
+
+        let self = this;
+        let getTextHtmlField = function (field, _document) {
+            let formatter = self.getOptionColumn(field).formatter;
+            let html = formatter(_document[field], _document);
+
+            return $(html).text();
+        };
+        let filterFoo = function (_document) {
+            this.isEqStrings = (a, b) => {
+                return a.toLocaleLowerCase().indexOf(b.toLocaleLowerCase()) === 0;
+            };
+            let filterPeriod = () => {
+                let period;
+
+                switch (self.currentPeriod) {
+                    case 'today':
+                        period = moment().startOf('day');
+                        break;
+                    case 'yesterday':
+                        period = moment().startOf('day').subtract(1, 'day');
+                        break;
+                    case 'week':
+                        period = moment().day("Monday");
+                        break;
+                    case 'sevendays':
+                        period = moment().startOf('day').subtract(7, 'day');
+                        break;
+                    case 'month':
+                        period = moment().startOf('month');
+                        break;
+                    case 'year':
+                        period = moment().startOf('year');
+                        break;
+                }
+                if (period === undefined)
+                    return true;
+
+                let nameDateSorted = self.getDateNameSorted();
+                return moment(_document[nameDateSorted]) > period
+            };
+            let filterDocumentNumber = () => {
+                let filter = self.filter.DeliveryNoteNumber;
+                if (filter === '')
+                    return true;
+                else if (_document['DeliveryNoteNumber'] === null)
+                    return false;
+                let text = getTextHtmlField('DeliveryNoteNumber', _document);
+                return this.isEqStrings(text, filter);
+            };
+            let dateOrderCreated = () => {
+                let filter = self.filter.OrderCreateTimestamp;
+                if (filter === '')
+                    return true;
+
+                let date = moment(_document['OrderCreateTimestamp']).format('DD.MM.YYYY');
+
+                return self.checkBetweenDates(date, filter);
+            };
+            let dateModify = () => {
+                let filter = self.filter.ModifyTimestamp;
+                if (filter === '')
+                    return true;
+
+                let date = moment(_document['ModifyTimestamp']).format('DD.MM.YYYY');
+
+                return self.checkBetweenDates(date, filter);
+            };
+            let dateFinalized = () => {
+                let filter = self.filter.CompletedTimestamp;
+                if (filter === '')
+                    return true;
+
+                let date = moment(_document['CompletedTimestamp']).format('DD.MM.YYYY');
+
+                return self.checkBetweenDates(date, filter);
+            };
+            let documentStatus = () => {
+                let filter = self.filter.FormattedStatus;
+                if (filter === 'Alle')
+                    return true;
+
+                return filter === _document['FormattedStatus'];
+            };
+            let documentInvoiceNumber = () => {
+                let filter = self.filter.InvoiceNumber;
+                if (filter === '')
+                    return true;
+                else if (_document['InvoiceNumber'] === null)
+                    return false;
+
+                let text = getTextHtmlField('InvoiceNumber', _document);
+                return this.isEqStrings(text, filter);
+            };
+            let invoiceStatus = () => {
+                let filter = self.filter.InvoiceStatusFormatted;
+                if (filter === 'Alle')
+                    return true;
+
+                return filter === _document['InvoiceStatusFormatted'];
+            };
+
+            return filterPeriod() &&
+                filterDocumentNumber() &&
+                dateOrderCreated() &&
+                dateModify() &&
+                dateFinalized() &&
+                documentStatus() &&
+                documentInvoiceNumber() &&
+                invoiceStatus();
+        };
+        let result = _.filter(documents, (_document) => {
+            return filterFoo(_document);
+        });
+
+        return result;
+    },
+    checkBetweenDates: function (date, filter) {
+        let dateFrom = filter.substr(0, filter.indexOf('-'));
+        dateFrom = dateFrom.substring(0, dateFrom.length - 1);
+        let dateTo = filter.substr(filter.indexOf('-'), filter.length);
+        dateTo = dateTo.substr(2);
+
+        var d1 = dateFrom.split(".");
+        var d2 = dateTo.split(".");
+        var c = date.split(".");
+
+        var from = new Date(d1[2], parseInt(d1[1])-1, d1[0]);
+        var to   = new Date(d2[2], parseInt(d2[1])-1, d2[0]);
+        var check = new Date(c[2], parseInt(c[1])-1, c[0]);
+
+        return check >= from && check <= to;
+    },
+    getCluster: function (index) {
+        return _.find(this.clusteredData, (data) => {
+            return data.index <= index && index <= data.index + data.rowspan - 1;
+        });
+    },
+    renderOneCluster: function (cluster, isOnlyShow) {
+        let rows = [];
+        let rowspan = 0;
+        let first_number;
+        let index = -1;
+
+        let ths = this.getTable().find('thead th');
+        let count_columns = ths.length;
+        let column = this.getTable().find('thead th[data-field = ' + cluster.field + ']');
+        let number_column = ths.index(column);
+        for (let i = 0; i < cluster.rowspan; i++) {
+            let number = number_column + cluster.index * count_columns + count_columns * i;
+
+            let $td = this.getTable().find('tbody tr td:eq(' + number + ')');
+            if (isOnlyShow === true) {
+                $td.show().removeAttr('rowspan').removeAttr('colspan');
+            } else {
+                if (i === 0) {
+                    $td.attr({rowspan: cluster.rowspan, colspan: 1, display: 'table-cell'});
+                } else $td.hide();
+            }
         }
     },
-    renderTopTable: function (todaySum, todayMarAbs, todayMwst, thisWeekSum, thisWeekMarAbs, thisWeekMwst, thisMonthSum, thisMonthMarAbs, thisMonthMwst,
-                              thisYearSum, thisYearMarAbs, thisYearMwst, documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor) {
-        var element = $('#dnTodaySum');
-        element[0].innerHTML = '\u20AC ' + formatOtherMoneyForPrint(todaySum);
-        element.addClass(todayTextColor);
 
-        element = $('#dnThisWeekSum');
-        element[0].innerHTML = '\u20AC ' + formatOtherMoneyForPrint(thisWeekSum);
-        element.addClass(thisWeekTextColor);
+    renderClusters: function (prev_last_index) {
+        this.setAttributesTdClusters(prev_last_index);
 
-        element = $('#dnThisMonthSum');
-        element[0].innerHTML = '\u20AC ' + formatOtherMoneyForPrint(thisMonthSum);
-        element.addClass(thisMonthTextColor);
-
-        element = $('#dnThisYearSum');
-        element[0].innerHTML = '\u20AC ' + formatOtherMoneyForPrint(thisYearSum);
-        element.addClass(thisYearTextColor);
-
-        element = $('#dnTodayMar');
-        if (todayMarAbs != 0) {
-            element[0].innerHTML = '% ' + formatProfitForPrint((todayMarAbs/todaySum) * 100) +
-                ' / \u20AC ' + formatProfitForPrint(todayMarAbs);
-        } else {
-            element[0].innerHTML = '% -  / \u20AC -';
-        }
-        element.addClass(todayTextColor);
-
-        element = $('#dnThisWeekMar');
-        if (thisWeekMarAbs != 0) {
-            element[0].innerHTML = '% ' + formatProfitForPrint((thisWeekMarAbs/thisWeekSum)*100) +
-                ' / \u20AC ' + formatProfitForPrint(thisWeekMarAbs);
-        } else {
-            element[0].innerHTML = '% -  / \u20AC -';
-        }
-        element.addClass(thisWeekTextColor);
-
-        element = $('#dnThisMonthMar');
-        if (thisMonthMarAbs != 0) {
-            element[0].innerHTML = '% ' + formatProfitForPrint((thisMonthMarAbs/thisMonthSum)*100) +
-                ' / \u20AC ' + formatProfitForPrint(thisMonthMarAbs);
-        } else {
-            element[0].innerHTML = '% -  / \u20AC -';
-        }
-        element.addClass(thisMonthTextColor);
-
-        element = $('#dnThisYearMar');
-        if (thisYearMarAbs != 0) {
-            element[0].innerHTML = '% ' + formatProfitForPrint((thisYearMarAbs/thisYearSum)*100) +
-                ' / \u20AC ' + formatProfitForPrint(thisYearMarAbs);
-        } else {
-            element[0].innerHTML = '% -  / \u20AC -';
-        }
-        element.addClass(thisYearTextColor);
-
-        element = $('#dnTodayArt');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(todayMwst);
-        element.addClass(todayTextColor);
-
-        element = $('#dnThisWeekArt');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisWeekMwst);
-        element.addClass(thisWeekTextColor);
-
-        element = $('#dnThisMonthArt');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisMonthMwst);
-        element.addClass(thisMonthTextColor);
-
-        element = $('#dnThisYearArt');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisYearMwst);
-        element.addClass(thisYearTextColor);
-
-        element = $('#dnTodayGr');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(todaySum + todayMwst);
-        element.addClass(todayTextColor);
-
-        element = $('#dnThisWeekGr');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisWeekSum + thisWeekMwst);
-        element.addClass(thisWeekTextColor);
-
-        element = $('#dnThisMonthGr');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisMonthSum + thisMonthMwst);
-        element.addClass(thisMonthTextColor);
-
-        element = $('#dnThisYearGr');
-        element[0].innerHTML = '\u20AC ' + formatProfitForPrint(thisYearSum + thisYearMwst);
-        element.addClass(thisYearTextColor);
+        this.setHandlerMouseover();
     },
-    recalculateTopTable: function (data) {
-        var todaySum = 0.0; //heute
-        var todayMarAbs = 0.0;
-        var todayMwst = 0.0;
-        var thisWeekSum = 0.0; //diese Woche
-        var thisWeekMarAbs = 0.0;
-        var thisWeekMwst = 0.0;
-        var thisMonthSum = 0.0; //diesen Monat
-        var thisMonthMarAbs = 0.0;
-        var thisMonthMwst = 0.0;
-        var thisYearSum = 0.0; //dieses Jahr
-        var thisYearMarAbs = 0.0;
-        var thisYearMwst = 0.0;
-        var documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor;
-        documentTextColor = todayTextColor = thisWeekTextColor = thisMonthTextColor = thisYearTextColor = '';
+    setAttributesTdClusters: function (prev_last_index) {
+        _.each(this.clusteredData, (cluster) => {
+            if (prev_last_index === undefined || (prev_last_index < cluster.index && cluster.index < this.lastVisibleIndex))
+                this.renderOneCluster(cluster);
+        });
+    },
+    setHandlerMouseover: function () {
+        let $table = this.getTable();
+        let $rows = $table.find('tbody tr');
+        let self = this;
+        _.each($rows, (row) => {
+            $(row).mouseenter(function () {
+                let index = $(this).data('index');
+                let cluster = self.getCluster(index);
+                if (cluster !== undefined) {
+                    let highlight_rows = self.getHighlightRows($rows, cluster);
+                    _.each(highlight_rows, (row) => {
+                        $(row).addClass('hover-row')
+                    })
+                }
+            });
+            $(row).mouseleave(function () {
+                let index = $(this).data('index');
+                let cluster = _.find(self.clusteredData, (data) => {
+                    return data.index <= index && index <= data.index + data.rowspan - 1;
+                });
+                if (cluster !== undefined) {
+                    let highlight_rows = self.getHighlightRows($rows, cluster);
+                    _.each(highlight_rows, (row) => {
+                        $(row).removeClass('hover-row')
+                    })
+                }
+            });
+        });
+    },
+    getHighlightRows: function ($rows, cluster) {
+        return _.filter($rows, (row) => {
+            return cluster.index <= $(row).data('index') && $(row).data('index') <= cluster.index + cluster.rowspan - 1;
+        });
+    },
+    setSettingPeriods: function (period) {
+        App.instance.thisUser.setSetting('periodDNList', period);
+        App.api.user.changeSetting.put('radio', 'periodDNList', period);
+    },
+    setSettingSort: function (sortName, direction) {
+        App.instance.thisUser.setSetting('sortsDNList_name', sortName);
+        App.api.user.changeSetting.put('radio', 'sortsDNList_name', sortName);
 
-        data.forEach(function (value) {
-            var productTotalSum = value.SumTotalPrice;
-            var today = moment().format();
-            today = moment().startOf('day');
-            if (moment(value.OrderCreateTimestamp) > today) {
-                todaySum = todaySum + value.SumTotalPrice;
-                todayMarAbs += value.SumTotalProfitAbsolute;
-                todayTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount, todayTextColor);
-                value.Products.forEach(function (item) {
-                    todayMwst += item.TotalTax;
-                });
+        App.instance.thisUser.setSetting('sortsDNList_direct', direction);
+        App.api.user.changeSetting.put('radio', 'sortsDNList_direct', direction);
+    },
+    getWasChangedRevenue: function (field, value) {
+        let result = false;
+        let fieldsRevenueFormatter = this.getFieldsRevenueFormatter();
+        if ((field === 'InvoiceNumber' && value === null) || fieldsRevenueFormatter.indexOf(field) !== -1)
+            result = true;
+        return result;
+    },
+});
+
+var DocumentTableView = Backbone.View.extend({
+    countOnPage: 50,
+    events: {},
+    showSpinner: function () {
+        this.$spinner.removeClass('hidden');
+    },
+    hideSpinner: function () {
+        this.$spinner.addClass('hidden');
+    },
+    getSpinner: function () {
+        return this.$parent_el.find('#table-spinner');
+    },
+    getToolbar: function () {
+        return this.$el.find('#toolbar-table');
+    },
+    formatPeriodDE: function () {
+        let result;
+        switch (this.currentPeriod) {
+            case 'today':
+                result = 'Heute';
+                break;
+            case 'yesterday':
+                result = 'Gestern';
+                break;
+            case 'week':
+                result = 'Diese Woche';
+                break;
+            case 'sevendays':
+                result = 'Letzte Woche';
+                break;
+            case 'month':
+                result = 'Dieser Monat';
+                break;
+            case 'year':
+                result = 'Dieses Jahr';
+                break;
+            default:
+                result = 'Alle Lieferscheine';
+        }
+        return result;
+    },
+    getButtonPeriod: function () {
+        return this.getToolbar().find('button#date-group-dropdown');
+    },
+    getButtonTax: function () {
+        return this.getToolbar().find('button#tax-button');
+    },
+    setTextButtonTax: function () {
+        this.$buttonTax.find('span:first-child')
+            .text(this.moneyTurnover.replace(/./, (str) => {
+                return str.toUpperCase()
+            }));
+    },
+    renderTopTable: function (filteredData) {
+        let dataTopTable = this.recalculateTopTable(filteredData);
+
+        let renderNetto = (period) => {
+            let $element = this.$el.find('#' + period + 'Sum');
+            $element.html('\u20AC ' + formatProfitForPrint(dataTopTable[period + 'Sum']));
+            $element.removeClass();
+            $element.addClass(dataTopTable[period + 'TextColor'])
+        };
+        renderNetto('today');
+        renderNetto('thisWeek');
+        renderNetto('thisMonth');
+        renderNetto('thisYear');
+
+        let renderMarge = (period) => {
+            let $element = this.$el.find('#' + period + 'Mar');
+            if (dataTopTable[period + 'MarAbs'] != 0) {
+                $element.html(
+                    '% ' + formatProfitForPrint((dataTopTable[period + 'MarAbs'] / dataTopTable[period + 'Sum']) * 100) +
+                    ' / \u20AC ' + formatProfitForPrint(dataTopTable[period + 'MarAbs'])
+                );
+            } else {
+                $element.html('% -  / \u20AC -');
             }
-            var thisWeek = moment().format();
-            thisWeek = moment().startOf('day');
-            var day = moment().day();
-            var diff = moment().date() - day + (day == 0 ? -6 : 1);
-            thisWeek = moment().day('diff');
-            if (moment(value.OrderCreateTimestamp) > thisWeek) {
-                thisWeekSum += value.SumTotalPrice;
-                thisWeekMarAbs += value.SumTotalProfitAbsolute;
-                thisWeekTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount, thisWeekTextColor);
-                value.Products.forEach(function (item) {
-                    thisWeekMwst += item.TotalTax;
-                });
-            }
-            var thisMonth = moment().startOf('month');
-            if (moment(value.OrderCreateTimestamp) > thisMonth) {
-                thisMonthSum += value.SumTotalPrice;
-                thisMonthMarAbs += value.SumTotalProfitAbsolute;
-                thisMonthTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount, thisMonthTextColor);
-                value.Products.forEach(function (item) {
-                    thisMonthMwst += item.TotalTax;
-                });
-            }
-            var thisYear = moment().startOf('year');
-            if (moment(value.OrderCreateTimestamp) > thisYear) {
-                thisYearSum += value.SumTotalPrice;
-                thisYearMarAbs += value.SumTotalProfitAbsolute;
-                thisYearTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount, thisYearTextColor);
-                value.Products.forEach(function (item) {
-                    thisYearMwst += item.TotalTax;
-                });
+            $element.removeClass().addClass(dataTopTable[period + 'TextColor']);
+        };
+        renderMarge('today');
+        renderMarge('thisWeek');
+        renderMarge('thisMonth');
+        renderMarge('thisYear');
+
+        let renderTax = (period) => {
+            let $element = this.$el.find('#' + period + 'Tax');
+            $element.html(
+                '\u20AC ' + formatOtherMoneyForPrint(dataTopTable[period + 'TaxA']) + ' / ' +
+                '\u20AC ' + formatOtherMoneyForPrint(dataTopTable[period + 'TaxB']) + ' / ' +
+                '\u20AC ' + formatOtherMoneyForPrint(dataTopTable[period + 'Tax'])
+            );
+            $element.removeClass().addClass(dataTopTable[period + 'TextColor']);
+        };
+        renderTax('today');
+        renderTax('thisWeek');
+        renderTax('thisMonth');
+        renderTax('thisYear');
+
+        let renderBrutto = (period) => {
+            let $element = this.$el.find('#' + period + 'Gr');
+            $element.html('\u20AC ' + formatProfitForPrint(dataTopTable[period + 'Sum'] + dataTopTable[period + 'Tax']));
+
+            $element.removeClass().addClass(dataTopTable[period + 'TextColor']);
+        };
+        renderBrutto('today');
+        renderBrutto('thisWeek');
+        renderBrutto('thisMonth');
+        renderBrutto('thisYear');
+    },
+    isCanceled: function (_document) {
+        return _document['Status'] === 'Canceled';
+    },
+    recalculateTopTable: function (_documents) {
+        if (_documents === undefined) {
+            if (this.isThisDeliveryNoteView())
+                _documents = this.notes.toJSON();
+            else
+                _documents = this.invoices.toJSON();
+        }
+        let todaySum = 0.0; //heute
+        let todayMarAbs = 0.0;
+        let todayTax = 0.0;
+        let todayTaxA = 0.0;
+        let todayTaxB = 0.0;
+        let thisWeekSum = 0.0; //diese Woche
+        let thisWeekMarAbs = 0.0;
+        let thisWeekTax = 0.0;
+        let thisWeekTaxA = 0.0;
+        let thisWeekTaxB = 0.0;
+        let thisMonthSum = 0.0; //diesen Monat
+        let thisMonthMarAbs = 0.0;
+        let thisMonthTax = 0.0;
+        let thisMonthTaxA = 0.0;
+        let thisMonthTaxB = 0.0;
+        let thisYearSum = 0.0; //dieses Jahr
+        let thisYearMarAbs = 0.0;
+        let thisYearTax = 0.0;
+        let thisYearTaxA = 0.0;
+        let thisYearTaxB = 0.0;
+        let todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor;
+        todayTextColor = thisWeekTextColor = thisMonthTextColor = thisYearTextColor = '';
+
+        let sortedDateName = this.getDateNameSorted();
+
+        let today = moment().startOf('day');
+        let thisWeek = moment().startOf('isoWeek');
+        let thisMonth = moment().startOf('month');
+        let thisYear = moment().startOf('year');
+
+        let getTax = (_document) => {return $.isNumeric(_document.SumTotalTax) ? _document.SumTotalTax : 0.0};
+        let getTaxA = (_document) => {return $.isNumeric(_document.ArticleTaxA) ? _document.ArticleTaxA : 0.0};
+        let getTaxB = (_document) => {return $.isNumeric(_document.ArticleTaxB) ? _document.ArticleTaxB : 0.0};
+        _.each(_documents, (_document) => {
+            this.setSelectOptionStatus(_document);
+            this.setSelectOptionContraDocumentStatus(_document);
+            this.setSelectOptionPaymentState(_document);
+
+            let momentDataSort = moment(_document[sortedDateName]);
+
+            if (this.isCanceled(_document) !== true) {
+                if (momentDataSort > today) {
+                    todaySum = todaySum + _document.SumTotalPrice;
+                    todayMarAbs += _document.SumTotalProfitAbsolute;
+                    todayTextColor = this.setTextColorHeader(_document.containsDailyPriceCount, todayTextColor);
+                    todayTax += getTax(_document);
+                    todayTaxA += getTaxA(_document);
+                    todayTaxB += getTaxB(_document);
+                }
+
+                if (momentDataSort > thisWeek) {
+                    thisWeekSum += _document.SumTotalPrice;
+                    thisWeekMarAbs += _document.SumTotalProfitAbsolute;
+                    thisWeekTextColor = this.setTextColorHeader(_document.containsDailyPriceCount, thisWeekTextColor);
+                    thisWeekTax += getTax(_document);
+                    thisWeekTaxA += getTaxA(_document);
+                    thisWeekTaxB += getTaxB(_document);
+                }
+
+                if (momentDataSort > thisMonth) {
+                    thisMonthSum += _document.SumTotalPrice;
+                    thisMonthMarAbs += _document.SumTotalProfitAbsolute;
+                    thisMonthTextColor = this.setTextColorHeader(_document.containsDailyPriceCount, thisMonthTextColor);
+                    thisMonthTax += getTax(_document);
+                    thisMonthTaxA += getTaxA(_document);
+                    thisMonthTaxB += getTaxB(_document);
+                }
+
+                if (momentDataSort > thisYear) {
+                    thisYearSum += _document.SumTotalPrice;
+                    thisYearMarAbs += _document.SumTotalProfitAbsolute;
+                    thisYearTextColor = this.setTextColorHeader(_document.containsDailyPriceCount, thisYearTextColor);
+                    thisYearTax += getTax(_document);
+                    thisYearTaxA += getTaxA(_document);
+                    thisYearTaxB += getTaxB(_document);
+                }
             }
         });
-        var result = {
+
+        this.optionsStatus.sort();
+        this.optionsStatusContraDocument.sort();
+        if(this.optionsPaymentState !== undefined)
+            this.optionsPaymentState.sort();
+
+        let result = {
             todaySum: todaySum,
             todayMarAbs: todayMarAbs,
-            todayMwst: todayMwst,
+            todayTax: todayTax,
+            todayTaxA: todayTaxA,
+            todayTaxB: todayTaxB,
+
             thisWeekSum: thisWeekSum,
             thisWeekMarAbs: thisWeekMarAbs,
-            thisWeekMwst: thisWeekMwst,
+            thisWeekTax: thisWeekTax,
+            thisWeekTaxA: thisWeekTaxA,
+            thisWeekTaxB: thisWeekTaxB,
+
             thisMonthSum: thisMonthSum,
             thisMonthMarAbs: thisMonthMarAbs,
-            thisMonthMwst: thisMonthMwst,
+            thisMonthTax: thisMonthTax,
+            thisMonthTaxA: thisMonthTaxA,
+            thisMonthTaxB: thisMonthTaxB,
+
             thisYearSum: thisYearSum,
             thisYearMarAbs: thisYearMarAbs,
-            thisYearMwst: thisYearMwst,
-            dataTop: data,
-            documentTextColor: documentTextColor,
+            thisYearTax: thisYearTax,
+            thisYearTaxA: thisYearTaxA,
+            thisYearTaxB: thisYearTaxB,
+
             todayTextColor: todayTextColor,
             thisWeekTextColor: thisWeekTextColor,
             thisMonthTextColor: thisMonthTextColor,
             thisYearTextColor: thisYearTextColor
+        };
+
+        return result;
+    },
+    setTextColorHeader: function (containsDailyPrice, previous_value) {
+        return setTextColorHeaderDocument(containsDailyPrice, previous_value);
+    },
+    setSelectOptionStatus: function (_document) {
+        if (_document.FormattedStatus !== null && this.optionsStatus.indexOf(_document.FormattedStatus) === -1)
+            this.optionsStatus.push(_document.FormattedStatus);
+    },
+    setAllData: function (noChangeLastVisibleIndex) {
+        this.filteredData = this.getFilteredData();
+        this.setData(noChangeLastVisibleIndex);
+    },
+    getOptionColumn: function (column) {
+        let $table = this.getTable();
+        let optionsTable = $table.bootstrapTable('getOptions');
+        let columnsOptions = optionsTable.columns[0];
+
+        return _.findWhere(columnsOptions, {field: column});
+    },
+    isThisDeliveryNoteView: function () {
+        return Object.getPrototypeOf(this).hasOwnProperty('isDeliveryNoteView');
+    },
+    setVisibleData: function (isNewData, noChangeLastVisibleIndex) {
+        let data;
+        if (this.isThisDeliveryNoteView())
+            data = this.filteredDataSortedClustered;
+        else data = this.filteredDataSorted;
+
+        if (isNewData === undefined || isNewData)
+            this.pageNumber = 0;
+
+        if (noChangeLastVisibleIndex === undefined || noChangeLastVisibleIndex !== true)
+            this.setLastVisibleIndex(noChangeLastVisibleIndex);
+        return data.slice(0, this.lastVisibleIndex + 1);
+    },
+    hiddenTable: function () {
+        this.isHiddenTable = true;
+        let table = this.getTable();
+        table.closest('div.fixed-table-container').addClass('hidden');
+        this.showSpinner();
+    },
+    removeExcessElements: function () {
+        let $bt_el = this.$el.find('div.clearfix');
+        let length = $bt_el.length;
+        if (length > 1)
+            $bt_el.remove(':lt(' + (length - 1) + ')');
+
+        $bt_el = this.$el.find('div.bootstrap-table');
+        length = $bt_el.length;
+        if (length > 1)
+            $bt_el.remove(':lt(' + (length - 1) + ')');
+    },
+    getCountVisible: function () {
+        return this.visibleData.length;
+    },
+    changeCountsDocument: function () {
+        this.getToolbar().find('.total-number-row').text(this.getCountVisible() + ' / ' + this.getCountAllData());
+    },
+    tableRenderHelper: function () {
+        this.drawSorts();
+        this.renderFilter();
+    },
+    renderFilter: function () {
+        let $ths = this.getTable().find('th');
+        let available_input_fields = this.getFieldsInputAvailable();
+        let select_status_field = 'FormattedStatus';
+        let select_contra_status_field = this.isThisDeliveryNoteView() ? 'InvoiceStatusFormatted' : 'DeliveryNotesStatusFormatted';
+        _.each($ths, (th) => {
+            let $th = $(th);
+            let field = $th.data('field');
+            if (available_input_fields.indexOf(field) !== -1) {
+                if ($th.hasClass('table-th-datepicker-block')) {
+                    let filter_el =
+                        '<div class="filter-control">' +
+                        '<input type="text" class="form-control" data-field="' + field + '"' +
+                        ' value="' + this.filter[field] + '"' +
+                        ' style="width: 100%; font-size: 10px!important" placeholder="Alle">' +
+                        '</div>';
+
+                    $th.find('div.fht-cell').html(filter_el);
+
+
+                    let filterDatepickerOptions = {
+                        locale: {
+                            format: 'DD.MM.YYYY',
+                            monthNames: [
+                                "Januari",
+                                "Februari",
+                                "Maart",
+                                "April",
+                                "Mei",
+                                "Juni",
+                                "Juli",
+                                "Augustus",
+                                "September",
+                                "Oktober",
+                                "November",
+                                "December"
+                            ],
+                            cancelLabel: 'Löschen'
+                        },
+                        autoclose: true,
+                        language: 'de',
+                        opens: 'center',
+                        drops: 'up',
+                        autoApply: true,
+                        autoUpdateInput: false
+                    };
+                    let el = $th.find('div.fht-cell input')[0];
+                    el.classList.add('daterange-text');
+                    $(el).daterangepicker(filterDatepickerOptions)
+                        .on('cancel.daterangepicker', function(e, picker) {
+                            $(el).val('');
+                            $(e.currentTarget).trigger($.Event('keyup', {keyCode: 13}));
+                        })
+                        .on('apply.daterangepicker', (e, picker) => {
+                            picker.element.val(picker.startDate.format(picker.locale.format) + ' - ' + picker.endDate.format(picker.locale.format));
+                            $(e.currentTarget).val(e.currentTarget.value);
+                            $(e.currentTarget).trigger($.Event('keyup', {keyCode: 13}));
+                        })
+                        .on('hide.daterangepicker', () => {
+                            this.setHandlers()
+                        });
+                } else {
+                    let filter_el_no_date =
+                        '<div class="filter-control">' +
+                        '<input type="text" class="form-control" data-field="' + field + '"' +
+                        ' value="' + this.filter[field] + '"' +
+                        ' style="width: 100%;" placeholder="Alle">' +
+                        '</div>';
+
+                    $th.find('div.fht-cell').html(filter_el_no_date);
+                }
+            } else if (field === select_status_field || field === select_contra_status_field || field === 'paymentState') {
+                this.renderSelectFilter(field, $th);
+            } else if ($th.hasClass('bst-checkbox')) {
+                let checkbox = '<input name="selectAll" type="checkbox">';
+                $th.find('div.th-inner').html(
+                    checkbox
+                );
+            }
+        });
+    },
+    renderSelectFilter: function (field, $th) {
+        if($th === undefined)
+            $th = this.getTable().find('th[data-field="' + field + '"]');
+
+        if($th !== undefined) {
+            let filter_el =
+                '<div class="filter-control">' +
+                '<select class="form-control" data-field="' + field + '" style="width: 100%;" dir="ltr"></select>' +
+                '</div>';
+            let $filter_el = $(filter_el);
+            let $select = $filter_el.find('select');
+
+            let available_options = this.getExistingOption(field);
+            _.each(available_options, (option, index) => {
+                $select[0].options[index] = new Option(option, option, option === this.filter[field], option === this.filter[field]);
+            });
+
+            $th.find('div.fht-cell').html(
+                $filter_el
+            );
+            this.setHandlersCommonTable();
+        }
+    },
+    sortTable: function (e) {
+        if ($(e.target).prop('tagName') === 'INPUT')
+            return;
+
+        this.hideTable();
+        let $target = $(e.currentTarget);
+        let sortName = $target.data('field');
+
+        let direction = $target.find('div.th-inner').hasClass('desc-sort') ? 'asc' : 'desc';
+
+        this.disableMainButton();
+        this.setDefaultTitleButtons();
+
+        let setting_dateNameSorted = this.getDateNameSorted();
+        let future_dateNameSorted = this.getDateNameSorted(sortName);
+
+        this.setSettingSort(sortName, direction);
+
+        this.setAllData();
+        if (setting_dateNameSorted !== future_dateNameSorted)
+            this.renderTopTableAfterFiltered();
+        this.reloadTable();
+    },
+    getClassesThInnerAvailable: function () {
+        return 'both-sort asc-sort desc-sort';
+    },
+    setClassThInner: function (th) {
+        let $th_inner = $(th).find('.th-inner');
+        $th_inner.removeClass(this.getClassesThInnerAvailable());
+
+        let columSort = this.getSortName();
+        let sortDirect = this.getSortDirection();
+
+        let field = $(th).data('field');
+
+        let class_name = 'both-sort';
+
+        if (field === columSort) {
+            switch (sortDirect) {
+                case 'asc':
+                    class_name = 'asc-sort';
+                    break;
+                case 'desc':
+                    class_name = 'desc-sort';
+                    break;
+            }
+        }
+        $th_inner.addClass(class_name);
+    },
+    drawSorts: function () {
+        let ths = this.getTable().find('th.sortable');
+        ths.each((i, th) => {
+            this.setClassThInner(th);
+        });
+    },
+    renderHideColumn: function () {
+        let settings = App.instance.thisUser.getSetting();
+        let prefix = this.isThisDeliveryNoteView() ? 'DN' : 'Invoice'
+        _.each(settings, (value, setting) => {
+            if (setting.indexOf(prefix + 'ListShowColumn_') === 0) {
+                let column = setting.slice((prefix + 'ListShowColumn_').length);
+                let isVisible = value === 'true';
+                this.toggleColumnVisible(column, isVisible);
+            }
+        });
+    },
+    toggleColumnVisible: function (column, isVisible) {
+        let ths = this.getTable().find('th');
+
+        let index = _.findIndex(ths, (th) => {
+            return $(th).data('field') === column;
+        });
+        let trs = this.getTable().find('tbody tr');
+
+        if (isVisible) {
+            $(ths[index]).removeClass('hidden');
+            _.each(trs, (tr) => {
+                $(tr).find('td:eq(' + index + ')').removeClass('hidden');
+            });
+        } else {
+            $(ths[index]).addClass('hidden');
+            _.each(trs, (tr) => {
+                $(tr).find('td:eq(' + index + ')').addClass('hidden');
+            });
+        }
+    },
+    offMainCheckbox: function () {
+        this.getTable().find('th.bst-checkbox input[type="checkbox"]').prop('checked', false);
+    },
+    setHandlersCommonParent: function () {
+        $('body').off('keyup').on('keyup', (e) => {
+            this.keyupOnList(e);
+        });
+        $('body').off('keydown').on('keydown', (e) => {
+            this.keydownOnList(e);
+        });
+        this.$parent_el.find('.overflow-wrapper').off('scroll').on('scroll', (e) => {
+            this.scrollChange(e);
+        });
+    },
+    keyupOnList: function (e) {
+        if (e.keyCode === 38) this.$buttonPageUp.trigger('click');
+        if (e.keyCode === 40) this.$buttonPageDown.trigger('click');
+    },
+    keydownOnList: function (e) {
+        if ('originalEvent' in e && 'repeat' in e.originalEvent && e.originalEvent.repeat)
+            return;
+
+        if (e.keyCode === 38 || e.keyCode === 40) {
+            let direction = e.keyCode === 38 ? 'up' : 'down';
+            this.handlerNavigator(e, direction);
+        }
+    },
+    handlerNavigator: function (event, direction) {
+        function captureClick(e) {
+            e.stopPropagation();
+            let event_opposite = event.type === 'keydown' ? 'keyup' : 'click';
+            window.removeEventListener(event_opposite, captureClick, true);
+        }
+
+        let pressTimer;
+        let $target = $(event.currentTarget);
+        pressTimer = setTimeout(() => {
+            let event_opposite = event.type === 'keydown' ? 'keyup' : 'click';
+            window.addEventListener(
+                event_opposite,
+                captureClick,
+                true
+            );
+            if (direction === 'up')
+                this.scrollTop();
+            else this.scrollBottom();
+        }, 1000);
+        let event_opposite = event.type === 'keydown' ? 'keyup' : 'mouseup';
+        $target.one(event_opposite, (event) => {
+            clearTimeout(pressTimer);
+        });
+    },
+    scrollTop: function () {
+        this.$parent_el.find('div.container').get(0).scrollIntoView(true);
+    },
+    scrollBottom: function () {
+        this.$parent_el.find('div.container').get(0).scrollIntoView(false);
+    },
+    scrollChange: function (e) {
+        if (this.isHiddenTable === true) {
+            this.isHiddenTable = false;
+            return;
+        }
+        if (this.scrollTimer)
+            clearTimeout(this.scrollTimer);
+        this.scrollTimer = setTimeout(() => {
+            this.changeNavigateButton();
+        }, 100);
+
+        if (this.isEndScroll(e) && this.haveHiddenData())
+            this.addRows(e);
+    },
+    isEndScroll: function (e) {
+        let $el = $(e.currentTarget);
+        let height_visible = $el.height();
+        let height_whole = $el.get(0).scrollHeight;
+        let available_scroll = height_whole - (height_visible + $el.scrollTop());
+
+        return available_scroll < 20;
+    },
+    haveHiddenData: function () {
+        return this.getCountVisible() < this.getCountAllData();
+    },
+    changeNavigateButton: function () {
+        let height_container = this.$parent_el.find('div.container').height();
+        let height_displayed = this.$parent_el.find('div.overflow-wrapper').height();
+        let scroll_height = height_container - height_displayed;
+
+        let top_scroll_wrapper = this.$parent_el.find('div.overflow-wrapper').scrollTop();
+
+        let count_summary = this.getCountAllData();
+        let count_visible = this.getCountVisible();
+
+        if (count_summary === count_visible && (scroll_height - 3) <= top_scroll_wrapper)
+            this.$buttonPageDown.prop('disabled', true);
+        else this.$buttonPageDown.prop('disabled', false);
+
+        if (top_scroll_wrapper - 3 <= 0)
+            this.$buttonPageUp.prop('disabled', true);
+        else this.$buttonPageUp.prop('disabled', false);
+    },
+    getVisibleDocument: function (index) {
+        return this.visibleData[index];
+    },
+    changeCheckedDocument: function (count) {
+        this.getToolbar().find('.checked-number-row').text(count);
+    },
+    getCheckedCheckbox: function () {
+        return this.getTable().find('tbody td.bst-checkbox input:checked');
+    },
+    getCheckbox: function () {
+        return this.getTable().find('tbody td.bst-checkbox input');
+    },
+    /**
+     * @returns {Array}
+     */
+    getAllSelectedDocuments: function () {
+        let checkeds = this.getCheckedCheckbox();
+        let result = [];
+        _.each(checkeds, (checkbox) => {
+            result.push(this.getVisibleDocument(this.getDataIndexCheckbox(checkbox)));
+        });
+        return result;
+    },
+    getDataIndexCheckbox: function (checkbox) {
+        return $(checkbox).closest('tr').data('index');
+    },
+    setHandlersRow: function ($row) {
+        $row.find('.show-delivery-note').off('click').on('click', (e) => {
+            this.showDocument(e);
+        });
+        $row.find('.show-invoice').off('click').on('click', (e) => {
+            this.showDocument(e);
+        });
+        $row.find('td.bst-checkbox input').off('change').on('change', (e) => {
+            this.renderParentButtonsStatus();
+        });
+    },
+    setHandlersCommonRows: function () {
+        this.getTable().find('.show-delivery-note').off('click').on('click', (e) => {
+            this.showDocument(e);
+        });
+        this.getTable().find('.show-invoice').off('click').on('click', (e) => {
+            this.showDocument(e);
+        });
+        this.getTable().find('tbody td.bst-checkbox input').off('change').on('change', (e) => {
+            let $target = $(e.currentTarget);
+            if (!$target.is(':checked'))
+                this.offMainCheckbox();
+
+            this.renderParentButtonsStatus();
+        });
+        this.getTable().find('tbody > tr[data-index] > td').off('click dblclick');
+    },
+    changeHideColumn: function (e) {
+        this.changeCheckboxSetting(e);
+
+        let column = $(e.target).data('field');
+        let isVisible = $(e.target).prop('checked');
+        this.toggleColumnVisible(column, isVisible);
+    },
+    changeCheckboxSetting: function (e) {
+        let nameSetting = e.target.getAttribute('id');
+        let value = $(e.target).prop('checked') + '';
+
+        App.api.user.changeSetting.put('checkbox', nameSetting, value);
+        App.instance.thisUser.setSetting(nameSetting, value);
+    },
+    showDocument: function (e) {
+        let $target = $(e.currentTarget);
+        let document_id = Number($target.data('id'));
+        let isClickDeliveryNote = $target.hasClass('show-delivery-note');
+
+        if (this.isMobile()) {
+            if (this.isFirstClick(document_id, isClickDeliveryNote)) {
+                e.preventDefault();
+                e.stopPropagation();
+
+                $('.popover').hide();
+                setTimeout(() => {
+                    $target.popover('show');
+                }, 200);
+                this.setLastClicked(document_id, isClickDeliveryNote);
+                let delayNotifySetting = Number(App.instance.thisUser.getSetting('delayNotifySetting')) * 1000;
+                this.popupTimerId = setTimeout(function () {
+                    $('.popover').hide();
+                }, delayNotifySetting + 200);
+                return;
+            }
+        } else
+            this.setLastClicked(document_id, isClickDeliveryNote);
+
+        this.renderLastClickedLink();
+        this.setSelectionModel(document_id, isClickDeliveryNote);
+    },
+    isFirstClick: function (document_id, isClickDeliveryNote) {
+        if(this.isThisDeliveryNoteView()) {
+            return document_id !== (   isClickDeliveryNote ? this.lastClicked : this.lastClickedContraDocument);
+        } else return document_id !== ( ! isClickDeliveryNote ? this.lastClicked : this.lastClickedContraDocument);
+    },
+    setSelectionModel: function (document_id, isClickDeliveryNote) {
+        document_id = document_id.toString();
+        let selection_model = isClickDeliveryNote ? 'SelectedDeliveryNoteId' : 'SelectedInvoiceId';
+        App.instance.selectionModel.set(selection_model, document_id);
+    },
+    setLastClicked: function (document_id, isClickDeliveryNote) {
+        if (this.isThisDeliveryNoteView()) {
+            this.lastClicked = isClickDeliveryNote ? document_id : 0;
+            this.lastClickedContraDocument = isClickDeliveryNote ? 0 : document_id;
+        } else {
+            this.lastClicked = !isClickDeliveryNote ? document_id : 0;
+            this.lastClickedContraDocument = !isClickDeliveryNote ? 0 : document_id;
+        }
+    },
+    renderLastClickedLink: function () {
+        this.getTable().find('tbody .show-delivery-note.last-clicked,.show-invoice.last-clicked').each(function () {
+            $(this).removeClass('last-clicked');
+        });
+        let _document = this.isThisDeliveryNoteView() ? 'delivery-note' : 'invoice';
+        let contra_document = this.isThisDeliveryNoteView() ? 'invoice' : 'delivery-note';
+        if (this.lastClicked !== 0)
+            this.getTable().find('tbody .show-' + _document + '[data-id = ' + this.lastClicked + ']').addClass('last-clicked');
+        if (this.lastClickedContraDocument !== 0)
+            this.getTable().find('tbody .show-' + contra_document + '[data-id = ' + this.lastClickedContraDocument + ']').addClass('last-clicked')
+    },
+    isMobile: function () {
+        return window.innerWidth <= 768;
+    },
+    setHandlersCommonTable: function () {
+        this.getTable().find('thead th.sortable').off('click').on('click', (e) => {
+            this.sortTable(e);
+        });
+        this.getTable().find('thead th input').off('keyup').on('keyup', (e) => {
+            this.keyupFilter(e);
+        });
+        this.getTable().find('thead th select').off('change').on('change', (e) => {
+            this.changeFilter(e);
+        });
+        this.getTable().find('thead th.bst-checkbox input[name = selectAll]').off('change').on('change', (e) => {
+            this.changeSelectAll(e);
+        });
+    },
+    setHandlersCommonToolbar: function () {
+        this.getToolbar().find('input[name="turnover"]').off('change').on('change', (e) => {
+            this.turnoverChanged(e);
+        });
+        this.getToolbar().find('input[name="period-document"]').off('change').on('change', (e) => {
+            this.changePeriod(e);
+        });
+        this.getToolbar().find('div[title="Spalten"] ul.dropdown-menu').on('click', (e) => {
+            e.stopPropagation();
+        });
+        this.getToolbar().find('.add-column-menu').off('change').on('change', (e) => {
+            this.changeHideColumn(e);
+        });
+    },
+    setHandlersCommonButtons: function () {
+        this.$buttonPageUp.off('mousedown').on('mousedown', (e) => {
+            this.mousedownPageUp(e);
+        });
+        this.$buttonPageUp.off('touchstart').on('touchstart', (e) => {
+            this.touchstartPageUp(e);
+        });
+        this.$buttonPageUp.off('click').on('click', () => {
+            this.clickPageUp();
+        });
+        this.$buttonPageDown.off('mousedown').on('mousedown', (e) => {
+            this.mousedownPageDown(e);
+        });
+        this.$buttonPageDown.off('touchstart').on('touchstart', (e) => {
+            this.touchstartPageDown(e);
+        });
+        this.$buttonPageDown.off('click').on('click', () => {
+            this.clickPageDown();
+        });
+        this.$buttonDeleteSelected.off('click').on('click', () => {
+            this.deleteDocuments();
+        });
+        this.$buttonFinalize.off('click').on('click', () => {
+            this.finalizeDocuments();
+        });
+        this.$buttonContraList.off('click').on('click', () => {
+            this.$parent_el.modal('hide');
+            this.openContraTable();
+        });
+    },
+    disabledForm: function () {
+        this.disableMainButton();
+        this.setDefaultTitleButtons();
+
+        this.getTable().find('thead th.sortable').addClass('disabled');
+        this.getTable().find('thead th input, thead th select').prop('disabled', true);
+        this.getToolbar().find('input[type="checkbox"], button').prop('disabled', true);
+    },
+    enabledForm: function () {
+        this.getTable().find('thead th input, thead th select').prop('disabled', false);
+        this.getToolbar().find('input[type="checkbox"], button').prop('disabled', false);
+        this.getTable().find('thead th.sortable').removeClass('disabled');
+    },
+    touchstartPageUp: function (e) {
+        this.handlerNavigator(e, 'up');
+    },
+    mousedownPageUp: function (e) {
+        if (!isTouchDevice())
+            this.handlerNavigator(e, 'up');
+    },
+    touchstartPageDown: function (e) {
+        this.handlerNavigator(e, 'down');
+    },
+    mousedownPageDown: function (e) {
+        if (!isTouchDevice())
+            this.handlerNavigator(e, 'down');
+    },
+    clickPageDown: function () {
+        let hiegth_header = this.$parent_el.find('nav.popup-header').height();
+        let position_scroll = -this.$parent_el.find('div.container').position().top + hiegth_header;
+
+        let height_displayed = this.$parent_el.find('div.overflow-wrapper').height();
+
+        this.$parent_el.find('div.overflow-wrapper').scrollTop(position_scroll + height_displayed);
+        this.changeNavigateButton();
+    },
+    clickPageUp: function () {
+        let hiegth_header = this.$parent_el.find('nav.popup-header').height();
+        let position_scroll = -this.$parent_el.find('div.container').position().top + hiegth_header;
+
+        let height_displayed = this.$parent_el.find('div.overflow-wrapper').height();
+
+        this.$parent_el.find('div.overflow-wrapper').scrollTop(position_scroll - height_displayed);
+        this.changeNavigateButton();
+    },
+
+    showTable: function () {
+        this.displayTable();
+
+        this.$parent_el.find('#buttonCloseModal .btn-danger').prop('disabled', false);
+
+        this.$buttonContraList.prop('disabled', false);
+        this.$buttonContraList.css({'opacity': '1'});
+
+        this.hideSpinner();
+
+        this.getToolbar().find('input[type="checkbox"], button').prop('disabled', false);
+        this.isHiddenTable = false;
+    },
+    displayTable: function () {
+        this.getTable().closest('div.fixed-table-container').removeClass('hidden');
+    },
+    hideTable: function () {
+        let $table = this.getTable();
+        this.setDefaultTitleButtons();
+        this.disableMainButton();
+
+        this.hiddenTable();
+
+        this.$parent_el.find('#buttonCloseModal .btn-danger').prop('disabled', true);
+        this.$buttonContraList.prop('disabled', true);
+        this.$buttonContraList.css({'opacity': '0.7'});
+
+        this.getToolbar().find('input[type="checkbox"], button').prop('disabled', true);
+    },
+    initializeCommonValues: function () {
+        this.timerRenderParentButtonsStatus = 0;
+        this.isHiddenTable = false;
+        this.lastClicked = 0;
+        this.lastClickedContraDocument = 0;
+        this.optionsStatus = ['Alle'];
+        this.optionsStatusContraDocument = ['Alle'];
+        this.visibleData = [];
+        this.filteredData = [];
+        this.filteredDataSorted = [];
+        this.lastVisibleIndex = 0;
+        this.pageNumber = 0;
+    },
+    changeSelectAll: function (e) {
+        if ($(e.currentTarget).is(':checked'))
+            this.checkAll();
+        else this.uncheckAll();
+    },
+    getAllFinalizedCanceled: function (arguments, document_status) {
+        let prev_value = arguments.allFinalizedCanceled;
+        let result = prev_value;
+        if (prev_value === null) {
+            if (document_status !== 'Completed' && document_status !== 'Canceled')
+                result = false;
+            else result = true;
+        } else if (prev_value === true && document_status !== 'Completed' && document_status !== 'Canceled')
+            result = false;
+        return result;
+    },
+    setAllFinalized: function (allFinalized, document_status) {
+        let result = allFinalized;
+        if (allFinalized === null) {
+            if (document_status !== 'Completed')
+                result = false;
+            else result = true;
+        } else if (allFinalized === true && document_status !== 'Completed')
+            result = false;
+
+        return result;
+    },
+    setAllCanceled: function (allCanceled, document_status) {
+        let result = allCanceled;
+        if (allCanceled === null) {
+            if (document_status !== 'Canceled')
+                result = false;
+            else result = true;
+        } else if (allCanceled === true && document_status !== 'Canceled')
+            result = false;
+
+        return result;
+    },
+    changePeriod: function (e) {
+        let $target = $(e.target);
+        let value = $target.val();
+
+        this.$buttonPeriod.find('span:first-child').text($target.next('span').text());
+
+        this.setSettingPeriods(value);
+        this.currentPeriod = this.getPeriod();
+
+        this.setAllData();
+        this.renderTopTableAfterFiltered();
+        this.reloadTable();
+    },
+    renderTopTableAfterFiltered: function () {
+        this.renderTopTable(this.filteredData);
+    },
+    reloadTable: function () {
+        this.hideTable();
+        setTimeout(() => {
+            let $table = this.getTable();
+            $table.remove();
+            let id = this.isThisDeliveryNoteView() ? 'delivery-notes' : 'invoices';
+            this.$el.append('<table id="' + id + '-table"></table>');
+
+            this.renderTable();
+        }, 0);
+    },
+    turnoverChanged: function (e) {
+        let value = $(e.target).val();
+        this.moneyTurnover = value;
+
+        this.setTextButtonTax();
+
+        let name_setting = this.isThisDeliveryNoteView() ? 'taxDNList' : 'taxInvoiceList';
+        App.instance.thisUser.setSetting(name_setting, this.moneyTurnover);
+        App.api.user.changeSetting.put('radio', name_setting, this.moneyTurnover);
+
+        this.setRevenues();
+        this.setAllData();
+
+        this.reloadTable();
+        this.$buttonTax.dropdown('toggle');
+    },
+    getRevenue: function (Document) {
+        let result = Document.get('SumTotalPrice');
+        if (result !== null && this.moneyTurnover === 'brutto')
+            result += Document.get('SumTotalTax');
+
+        return result;
+    },
+    keyupFilter: function (e) {
+        if (e.keyCode === 13)
+            this.changeFilter(e);
+    },
+    changeFilter: function (e) {
+        let $item = $(e.currentTarget);
+
+        let field = $item.data('field');
+        let value = $item.val().trim();
+
+        if (this.filter[field] !== value) {
+            this.filter[field] = value;
+
+            this.hideTable();
+
+            setTimeout(() => {
+                this.setAllData();
+                this.renderTopTableAfterFiltered();
+                this.reloadTable();
+            }, 0);
+        }
+    },
+    setSorted: function () {
+        let documents = _.clone(this.filteredData);
+
+        let property = this.getSortName();
+        let predicat_direction = (this.getSortDirection() === 'asc') ? 1 : -1;
+
+        let main_field = this.isThisDeliveryNoteView() ? 'DeliveryNoteNumber' : 'InvoiceNumber';
+
+        let compareByTitle = (a, b) => {
+
+            //TODO may be null (was fixed by migration)
+            if(!this.isThisDeliveryNoteView())
+                switch (true) {
+                    case a['InvoiceNumber'] === null && b['InvoiceNumber'] === null:
+                        return 0;
+                    case a['InvoiceNumber'] === null:
+                        return -1;
+                    case b['InvoiceNumber'] === null:
+                        return 1;
+                }
+
+            return a[main_field].toLowerCase().localeCompare(b[main_field].toLowerCase()) > 0 ? predicat_direction :
+                (
+                    a[main_field].toLowerCase().localeCompare(b[main_field].toLowerCase()) < 0 ?
+                        -predicat_direction : 0
+
+                );
+        };
+        let isNull = (property) => {
+            return property === null || property === '0000-00-00 00:00:00';
+        };
+        documents.sort((a, b) => {
+            if (isNull(a[property]) && isNull(b[property]))
+                return 0;
+            if (isNull(a[property]))
+                return 1;
+            if (isNull(b[property]))
+                return -1;
+
+            switch (true) {
+                case typeof a[property] === "string" && typeof b[property] === "string":
+                    return a[property].toLowerCase().localeCompare(b[property].toLowerCase()) > 0 ? predicat_direction :
+                        (
+                            a[property].toLowerCase().localeCompare(b[property].toLowerCase()) < 0 ?
+                                -predicat_direction :
+                                (
+                                    property !== main_field ?
+                                        compareByTitle(a, b) : 0
+                                )
+                        );
+                    break;
+                case !this.isThisDeliveryNoteView() && property === 'sourceDeliveryNotes':
+                    return a[property][0]['Number'] > b[property][0]['Number'] ? predicat_direction :
+                        (
+                            a[property][0]['Number'] < b[property][0]['Number'] ?
+                                -predicat_direction : 0
+                        );
+                    break;
+                default:
+                    return a[property] > b[property] ? predicat_direction :
+                        (
+                            a[property] < b[property] ?
+                                -predicat_direction : 0
+                        );
+            }
+        });
+        this.filteredDataSorted = documents;
+    },
+    wasRenameDeletedDocuments: function () {
+        return App.instance.thisUser.getSetting('renameDeletedDocuments') === 'true';
+    },
+    isEqualCollections: function () {
+        return this.customerId === 0;
+    },
+    getWasChangedCancelStatus: function (Changes) {
+        let result = false;
+
+        if(Changes.changed.hasOwnProperty('Status'))
+            if(Changes.changed.Status === 'Canceled' || Changes.previousAttributes()['Status'] === 'Canceled')
+                result = true;
+
+        return result;
+    },
+    updateView: function () {
+        this.disableMainButton();
+        this.setDefaultTitleButtons();
+
+        this.setAllData();
+        this.renderTopTableAfterFiltered();
+
+        this.reloadTable();
+    },
+    changeTable: function (changes) {
+        if (changes !== undefined && changes instanceof Backbone.Model)
+            this.applyChanges(changes);
+        this.renderParentButtonsStatus();
+    },
+    renderNumberColumn: function (index_row, field){
+        let index_column = '',
+            html = '',
+            documentNumber = '';
+
+        let $row = this.getRow(index_row);
+        index_column = this.getTable().find('th[data-field="' + field + '"]').index();
+        documentNumber = this.getTd(index_row, index_column)[0].innerText.split(' ')[0];
+        html = this.getOptionColumn(field).formatter(documentNumber, this.visibleData[index_row], '');
+
+        let $td = this.getTd(index_row, index_column);
+        html = this.returnLastClicked(html, $td);
+
+        $td.html(html);
+        this.setHandlersRow($row);
+    },
+    resetCollection: function () {
+        this.updateView();
+    },
+    removeCollection: function (models, collection, options) {
+    },
+    updateTable: function (collection, options) {
+        let needReloadTable = false;
+        let added = options.changes.added;
+        let removed = options.changes.removed;
+
+        if (removed.length > 0) {
+            needReloadTable = this.removeDocumentRows(removed);
+        }
+
+        if (!needReloadTable && added.length > 0) {
+            this.offMainCheckbox();
+            needReloadTable = this.addDocumentRows(added);
+        }
+        if (!needReloadTable) {
+            setTimeout(() => {
+                this.setAllData(true);
+                this.renderHideColumn();
+                this.setAllIndexTable();
+                this.changeCountsDocument();
+                this.setHandlersCommonRows();
+                this.setHandlerMouseover();
+                customDelay(() => this.renderTopTableAfterFiltered(), 200);
+            }, 0);
+        } else {
+            this.updateView();
+        }
+        this.renderParentButtonsStatus();
+    },
+    setAllIndexTable: function () {
+        let $rows = this.getTable().find('tbody tr');
+        _.each($rows, (row, index) => {
+            if ($(row).find('td').length > 1) {
+                $(row).data('index', index);
+                $(row).find('td:first-child').text(index + 1);
+            }
+        });
+    },
+
+    /**
+     *
+     * @param collection
+     * @param document_id
+     * @returns {number|-1}
+     */
+    findIndexCollection: function (collection, document_id) {
+        return _.findIndex(collection, (data) => {
+            return data['Id'] === document_id
+        });
+    },
+    reRenderTurnoverField: function (_document, index_row) {
+        let option = this.getOptionColumn('revenue');
+        let html = '';
+        if (option !== undefined && option.hasOwnProperty('formatter')) {
+            html = option.formatter(null, _document);
+        }
+
+        let index_column = this.getTable().find('th[data-field="revenue"]').index();
+        this.getTd(index_row, index_column).html(html);
+    },
+    getFieldsAvailable: function () {
+        let $table = this.getTable();
+        let optionsTable = $table.bootstrapTable('getOptions');
+        let Columns = optionsTable.columns[0];
+        let result = [];
+        _.each(Columns, Column => {
+            if (typeof Column.field === 'string')
+                result.push(Column.field);
+        });
+        return result;
+    },
+    getNewData: function (Changes) {
+        let result = Changes.toJSON();
+        return result;
+    },
+    getRow: function (index_row) {
+        return this.getTable().find('tbody tr:eq(' + index_row + ')');
+    },
+    getTd: function (index_row, index_column) {
+        return this.getRow(index_row).find('td:eq(' + index_column + ')');
+    },
+    deleteTableRows: function ($rows) {
+        $rows.remove();
+        if (this.isTableHaveNoRow() === true) {
+            let optionsTable = this.getTable().bootstrapTable('getOptions');
+            if (!optionsTable.hasOwnProperty('columns') || optionsTable.columns.length === 0)
+                return;
+
+            let noMatchesMsg = "No matches";
+            if ('formatNoMatches' in optionsTable) {
+                noMatchesMsg = optionsTable.formatNoMatches();
+            }
+            let columnsOption = optionsTable.columns[0];
+            this.getTable().find('tbody')
+                .append('<tr class="no-records-found"><td colspan="' + columnsOption.length + '">' + noMatchesMsg + '</td></tr>');
+        }
+    },
+    isTableHaveNoRow: function () {
+        return this.getTable().find('tbody tr').length === 0;
+    },
+    addRows: function (e) {
+        $(e.currentTarget).off('scroll');
+
+        this.offMainCheckbox();
+        let last_index = this.getCountVisible() - 1;
+        this.pageNumber++;
+        this.visibleData = this.setVisibleData(false);
+
+        let newData = this.visibleData.slice(last_index + 1);
+
+        let $table = this.getTable();
+        let optionsTable = $table.bootstrapTable('getOptions');
+
+        if (!optionsTable.hasOwnProperty('columns') || optionsTable.columns.length === 0)
+            return;
+
+        let columnsOption = optionsTable.columns[0];
+        let index = last_index;
+
+        let $elements = $('<tmp></tmp>');
+        _.each(newData, () => {
+            index++;
+            let $tr = this.getNewRow(index, optionsTable, columnsOption);
+            $elements.append($tr);
+        });
+
+        setTimeout(() => {
+            $table.find('tbody').append($elements.html());
+
+            this.renderClusters(last_index);
+            this.renderHideColumn();
+            $(e.currentTarget).on('scroll', (e) => {
+                this.scrollChange(e);
+            });
+            this.changeCountsDocument();
+            this.setHandlersCommonRows();
+            this.changeNavigateButton();
+        }, 0);
+    },
+    getNewRow: function (index, optionsTable, columnsOption) {
+        let result = $('<tr data-index="' + index + '"></tr>');
+        let _document = this.visibleData[index];
+        _.each(columnsOption, (option) => {
+            let $td = $('<td></td>');
+            if (option.hasOwnProperty('class'))
+                $td.addClass(option.class);
+            if (option.hasOwnProperty('formatter'))
+                $td.html(option.formatter(_document[option.field], _document, index));
+
+            result.append($td);
+        });
+        return result;
+    },
+    addDocumentRows: function (added) {
+        let needReloadTable = false;
+        if (this.getSortName() === (this.isThisDeliveryNoteView() ? 'OrderCreateTimestamp' : 'CreateTimestamp')) {
+            if (this.getSortDirection() === 'desc' || !this.haveHiddenData()) {
+                let $table = this.getTable();
+                let optionsTable = $table.bootstrapTable('getOptions');
+                if (!optionsTable.hasOwnProperty('columns') || optionsTable.columns.length === 0)
+                    return;
+
+                let columnsOption = optionsTable.columns[0];
+                let $elements = $('<tmp></tmp>');
+                if (this.getSortDirection() === 'desc') {
+                    _.each(added, (Document) => {
+                        this.visibleData.unshift(this.getNewData(Document));
+                        this.lastVisibleIndex++;
+                    });
+                    for (let i = 0; i < added.length; i++) {
+                        let $tr = this.getNewRow(i, optionsTable, columnsOption);
+                        $elements.append($tr);
+                    }
+                    $table.find('tbody').prepend($elements.html());
+                } else if (!this.haveHiddenData()) {
+                    _.each(added, (Document) => {
+                        this.visibleData.push(this.getNewData(Document));
+                        this.lastVisibleIndex++;
+                    });
+                    for (let i = this.lastVisibleIndex - (added.length - 1); i <= this.lastVisibleIndex; i++) {
+                        let $tr = this.getNewRow(i, optionsTable, columnsOption);
+                        $elements.append($tr);
+                    }
+                    $table.find('tbody tr.no-records-found').remove();
+                    $table.find('tbody').append($elements.html());
+                }
+            }
+        } else needReloadTable = true;
+
+        return needReloadTable;
+    },
+    getRowIndex: function (document_id) {
+        return _.findIndex(this.visibleData, (document_visible) => {
+            return document_visible['Id'] === document_id;
+        });
+    },
+    hasInvolvedField: function (changes) {
+        let result = false;
+        for(let field in changes)
+            if(this.getInvolvedContraDocumentFields().indexOf(field) !== -1) {
+                result = true;
+                break;
+            }
+        return result;
+    },
+    getExistingOption: function (field) {
+        let result = false;
+        switch (field) {
+            case 'paymentState':
+                result = this.optionsPaymentState;
+                break;
+            case 'FormattedStatus':
+                result = this.optionsStatus;
+                break;
+            default:
+                result = this.optionsStatusContraDocument;
         }
         return result;
     },
-    addRowsOnScroll: function () {
-        var self = this;
-        var scHeight = $('#delivery-notes-scroll-listener').get(0).scrollHeight;
-        var clHeight = $('#delivery-notes-scroll-listener').get(0).clientHeight;
-        var parent = this;
-        var thisTable = this.$el.find('#delivery-notes-table');
-        var pageUp = this.$el.closest('#delivery-note-list-modal').find('.page-up-dn');
-        var pageDown = this.$el.closest('#delivery-note-list-modal').find('.page-down-dn');
-        var status = $('.bootstrap-table-filter-control-FormattedStatus');
-        var secondStatus = $('.bootstrap-table-filter-control-InvoiceNumberForStatus');
-        var data = this.notes.toJSON();
-        var countDocuments;
-        var end = data.length - 60;
-        var start = data.length - 30;
-        var newData = data.slice(end, start);
-        var showArrowsSummary;
-        if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-            showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-            if (showArrowsSummary == 'false') {
-                $('.arrowLineForTables span').css({'margin-left' : '0'});
-            }
-        } else {
-            showArrowsSummary = 'true';
-        }
-        newData.forEach(function (value) {
-            value.showArrowsSummary = showArrowsSummary;
-        });
-        $('#delivery-notes-scroll-listener').scroll(function () {
-            if ($('#delivery-notes-table')[0].rows[1].classList[0] == 'no-records-found') {
-                countDocuments = 0;
-            } else {
-                countDocuments = $('#delivery-notes-table')[0].rows.length - 1;
-            }
-            pageUp.removeClass('arrowVisible');
-            pageDown.removeClass('arrowVisible');
-            pageUp.removeAttr('disabled');
-            pageDown.removeAttr('disabled');
-            if ((end <= 0) && (scHeight <= (clHeight + $('#invoice-scroll-listener').scrollTop() + 1))) {
-                pageDown.attr('disabled', 'disabled');
-                pageDown.addClass('arrowVisible');
-            }
-            if ($('#delivery-notes-scroll-listener').scrollTop() == 0) {
-                pageUp.attr('disabled', 'disabled');
-                pageUp.addClass('arrowVisible');
-            }
-            if (self.currentUmsatz === 'brutto') {
-                var elementsToShow = document.getElementsByClassName('revenueLineBruttoUmsatz');
-                var elementsToHide = document.getElementsByClassName('revenueLine');
-                _.each(elementsToShow, function (row) {
-                    row.classList.remove("hided-content");
-                });
-                _.each(elementsToHide, function (row) {
-                    row.classList.add("hided-content");
-                });
-            }
-            if (scHeight <= (clHeight + $('#delivery-notes-scroll-listener').scrollTop()  + 40)) {
-                var scTop = $('#delivery-notes-scroll-listener').scrollTop();
-                if (status.get(0).value == '' && secondStatus.get(0).value == '') {
-                    if (countDocuments < data.length) {
-                        if (end >= 0) {
-                            thisTable.bootstrapTable('append', newData);
-                            start -= 30;
-                            end -= 30;
-                            scHeight = $('#delivery-notes-scroll-listener').get(0).scrollHeight;
-                            clHeight = $('#delivery-notes-scroll-listener').get(0).clientHeight;
-                            newData = data.slice(end, start);
-                            if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-                                showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-                                if (showArrowsSummary == 'false') {
-                                    $('.arrowLineForTables span').css({'margin-left' : '0'});
-                                }
-                            } else {
-                                showArrowsSummary = 'true';
-                            }
-                            newData.forEach(function (value) {
-                                value.showArrowsSummary = showArrowsSummary;
-                                var productTotalSum = value.SumTotalPrice;
-                                var documentTextColor;
-                                var revenueString = formatProfitForPrint(productTotalSum);
-                                var valueTax = 0.0;
-                                value.Products.forEach(function (item) {
-                                    valueTax += item.TotalTax;
-                                });
-                                var productTotalSumWithTax = productTotalSum + valueTax;
-                                var revenueBruttoString = formatProfitForPrint(productTotalSumWithTax);
-                                if (revenueString === '-') {
-                                    value.revenue = '-';
-                                } else {
-                                    var revenueInvoice = 0;
-                                    if (App.instance.invoices) {
-                                        var invoice_id = value.InvoiceId;
-                                        if (invoice_id !== null) {
-                                            var Invoices_collection = App.instance.invoices;
-                                            var invoice = Invoices_collection.get(invoice_id);
-                                            if (invoice != undefined) {
-                                                revenueInvoice = typeof invoice.get('SumTotalPrice') !== 'undefined' ? invoice.get('SumTotalPrice') : null;
-                                                revenueInvoice = ' \u20AC ' + formatProfitForPrint(revenueInvoice);
-                                            }
-                                        } else {
-                                            revenueInvoice = '-';
-                                        }
-                                    }
-                                    documentTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount);
-                                    var nettoHidedClass = self.currentUmsatz === 'netto' ? '' : ' hided-content';
-                                    var bruttoHidedClass = self.currentUmsatz === 'brutto' ? '' : ' hided-content';
-                                    value.revenue = '<div class="revenueLine' + nettoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueString + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>' +
-                                        '<div class="revenueLineBruttoUmsatz' + bruttoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueBruttoString + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                                        '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>';
-                                }
-                            });
-                            parent.processedData = data;
-                            parent.currentData = parent.currentData.concat(newData);
-                            parent.paginationNewData = newData;
-                            var clusterCheckbox = document.getElementById('deliveryNoteCluster');
-                            self.clustered = clusterCheckbox.checked;
-                            if (self.clustered) {
-                                self.clustering();
-                                self.toCluster();
-                                self.drawSorts();
-                            }
-                            return parent.paginationNewData;
-                        } else {
-                            end = 0;
-                        }
-                    }
-                }
-            }
+    getFieldsSelect: function () {
+        let $fields_select = this.getTable().find('th:has(select)');
+        return _.map($fields_select, ($field) => {
+            return $($field).data('field');
         });
     },
-    tableSwitchFilterHelper: function ($el) {
-        $el.find('.fht-cell input').attr('placeholder', 'Alle');
-        $el.find('.fht-cell select option:first-child').text('Alle');
-    },
-    filterPeriod: function (isClustering) {
-        var parent = this;
-        if (isClustering)
-        {
-            var existingData = parent.currentData;
-        }
-        else
-        {
-            var existingData = parent.calculedNotes;
-        }
-        var filteredData = [];
-        if (parent.currentPeriod == 'today') {
-            var today = new Date();
-            today.setHours(0, 0, 0, 0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > today) {
-                    filteredData.push(value);
-                }
-            });
-        }
-        if (parent.currentPeriod == 'yesterday') {
-            var yesterdate = new Date();
-            yesterdate.setDate(yesterdate.getDate() - 1);
-            yesterdate.setHours(0, 0, 0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > yesterdate) {
-                    filteredData.push(value);
-                }
-            });
-        }
-        if (parent.currentPeriod == 'week') {
-            var thisWeek = new Date();
-            thisWeek.setHours(0, 0, 0, 0);
-            var day = thisWeek.getDay();
-            var diff = thisWeek.getDate() - day + (day == 0 ? -6 : 1);
-            thisWeek = new Date(thisWeek.setDate(diff));
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > thisWeek) {
-                    filteredData.push(value);
-                }
-            });
-        }
-        if (parent.currentPeriod == 'sevendays') {
-            var sevendays = new Date();
-            sevendays.setDate(sevendays.getDate() - 7);
-            sevendays.setHours(0, 0, 0, 0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > sevendays) {
-                    filteredData.push(value);
-                }
-            });
-        }
-        if (parent.currentPeriod == 'month') {
-            var thisMonth = new Date();
-            thisMonth = new Date(thisMonth.getFullYear(), thisMonth.getMonth(), 1);
-            thisMonth.setHours(0,0,0,0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > thisMonth) {
-                    filteredData.push(value);
-                }
-            });
-        }
-        if (parent.currentPeriod == 'year') {
-            var thisYear = new Date(new Date().getFullYear(), 0, 1);
-            thisYear.setHours(0,0,0,0);
-            existingData.forEach(function (value) {
-                if (new Date(value.OrderCreateTimestamp) > thisYear) {
-                    filteredData.push(value);
-                }
-            });
-        }
-        if (parent.currentPeriod == 'all') {
-            filteredData = existingData;
-        }
-        return filteredData;
-    },
-    setSorts: function () {
-        var parent = this;
-        this.$el.find('.filter-control').off().on('click', function (event) {event.stopPropagation();});
-        $('th').off().on('click', function (e) {
-            if (e.target.className != "form-control bootstrap-table-filter-control-FormattedStatus" && e.target.className != "form-control bootstrap-table-filter-control-InvoiceNumberForStatus") {
-                var data = parent.filterPeriod(false);
-                var columnName = '';
-                var columnOrdering = '';
-                if (e.currentTarget.attributes['data-field'].nodeValue == 'DeliveryNoteNumber') {
-                    columnName = e.currentTarget.attributes['data-field'].nodeValue;
-                    if (parent.DeliveryNoteNumberColSort == 'no' || parent.DeliveryNoteNumberColSort == 'desc') {
-                        parent.DeliveryNoteNumberColSort = 'asc';
-                        columnOrdering = 'asc';
-                        data.sort(function (a, b) {
-                            return (a.DeliveryNoteNumber > b.DeliveryNoteNumber) ? 1 : ((b.DeliveryNoteNumber > a.DeliveryNoteNumber) ? -1 : 0);
-                        });
-                    } else {
-                        parent.DeliveryNoteNumberColSort = 'desc';
-                        columnOrdering = 'desc';
-                        data.sort(function (a, b) {
-                            return (a.DeliveryNoteNumber < b.DeliveryNoteNumber) ? 1 : ((b.DeliveryNoteNumber < a.DeliveryNoteNumber) ? -1 : 0);
-                        });
-                    }
-                    parent.OrderCreateTimestampColSort = 'no';
-                    parent.ModifyTimestampColSort = 'no';
-                    parent.CompletedTimestampColSort = 'no';
-                    parent.FormattedStatusColSort = 'no';
-                    parent.InvoiceNumberColSort = 'no';
-                    parent.InvoiceNumberForStatusColSort = 'no';
-                    parent.revenueColSort = 'no';
-                }
-                if (e.currentTarget.attributes['data-field'].nodeValue == 'OrderCreateTimestamp') {
-                    columnName = e.currentTarget.attributes['data-field'].nodeValue;
-                    if (parent.OrderCreateTimestampColSort == 'no' || parent.OrderCreateTimestampColSort == 'desc') {
-                        parent.OrderCreateTimestampColSort = 'asc';
-                        columnOrdering = 'asc';
-                        data.sort(function (a, b) {
-                            return (a.OrderCreateTimestamp < b.OrderCreateTimestamp) ? 1 : ((b.OrderCreateTimestamp < a.OrderCreateTimestamp) ? -1 : 0);
-                        });
-                    } else {
-                        parent.OrderCreateTimestampColSort = 'desc';
-                        columnOrdering = 'desc';
-                        data.sort(function (a, b) {
-                            return (a.OrderCreateTimestamp > b.OrderCreateTimestamp) ? 1 : ((b.OrderCreateTimestamp > a.OrderCreateTimestamp) ? -1 : 0);
-                        });
-                    }
-                    parent.DeliveryNoteNumberColSort = 'no';
-                    parent.ModifyTimestampColSort = 'no';
-                    parent.CompletedTimestampColSort = 'no';
-                    parent.FormattedStatusColSort = 'no';
-                    parent.InvoiceNumberColSort = 'no';
-                    parent.InvoiceNumberForStatusColSort = 'no';
-                    parent.revenueColSort = 'no';
-                }
-                if (e.currentTarget.attributes['data-field'].nodeValue == 'ModifyTimestamp') {
-                    columnName = e.currentTarget.attributes['data-field'].nodeValue;
-                    if (parent.ModifyTimestampColSort == 'no' || parent.ModifyTimestampColSort == 'desc') {
-                        parent.ModifyTimestampColSort = 'asc';
-                        columnOrdering = 'asc';
-                        data.sort(function (a, b) {
-                            return (a.ModifyTimestamp < b.ModifyTimestamp) ? 1 : ((b.ModifyTimestamp < a.ModifyTimestamp) ? -1 : 0);
-                        });
-                    } else {
-                        parent.ModifyTimestampColSort = 'desc';
-                        columnOrdering = 'desc';
-                        data.sort(function (a, b) {
-                            return (a.ModifyTimestamp > b.ModifyTimestamp) ? 1 : ((b.ModifyTimestamp > a.ModifyTimestamp) ? -1 : 0);
-                        });
-                    }
-                    parent.DeliveryNoteNumberColSort = 'no';
-                    parent.OrderCreateTimestampColSort = 'no';
-                    parent.CompletedTimestampColSort = 'no';
-                    parent.FormattedStatusColSort = 'no';
-                    parent.InvoiceNumberColSort = 'no';
-                    parent.InvoiceNumberForStatusColSort = 'no';
-                    parent.revenueColSort = 'no';
-                }
-                if (e.currentTarget.attributes['data-field'].nodeValue == 'CompletedTimestamp') {
-                    columnName = e.currentTarget.attributes['data-field'].nodeValue;
-                    if (parent.CompletedTimestampColSort == 'no' || parent.CompletedTimestampColSort == 'desc') {
-                        parent.CompletedTimestampColSort = 'asc';
-                        columnOrdering = 'asc';
-                        data.sort(function (a, b) {
-                            return (a.CompletedTimestamp < b.CompletedTimestamp) ? 1 : ((b.CompletedTimestamp < a.CompletedTimestamp) ? -1 : 0);
-                        });
-                    } else {
-                        parent.CompletedTimestampColSort = 'desc';
-                        columnOrdering = 'desc';
-                        data.sort(function (a, b) {
-                            return (a.CompletedTimestamp > b.CompletedTimestamp) ? 1 : ((b.CompletedTimestamp > a.CompletedTimestamp) ? -1 : 0);
-                        });
-                    }
-                    parent.DeliveryNoteNumberColSort = 'no';
-                    parent.OrderCreateTimestampColSort = 'no';
-                    parent.ModifyTimestampColSort = 'no';
-                    parent.FormattedStatusColSort = 'no';
-                    parent.InvoiceNumberColSort = 'no';
-                    parent.InvoiceNumberForStatusColSort = 'no';
-                    parent.revenueColSort = 'no';
-                }
-                if (e.currentTarget.attributes['data-field'].nodeValue == 'InvoiceNumber') {
-                    columnName = e.currentTarget.attributes['data-field'].nodeValue;
-                    if (parent.InvoiceNumberColSort == 'no' || parent.InvoiceNumberColSort == 'desc') {
-                        parent.InvoiceNumberColSort = 'asc';
-                        columnOrdering = 'asc';
-                        data.sort(function (a, b) {
-                            if (a.InvoiceNumber == null) {
-                                return 1;
-                            }
-                            if (b.InvoiceNumber == null) {
-                                return -1;
-                            }
-                            return (a.InvoiceNumber > b.InvoiceNumber) ? 1 : ((b.InvoiceNumber > a.InvoiceNumber) ? -1 : 0);
-                        });
-                    } else {
-                        parent.InvoiceNumberColSort = 'desc';
-                        columnOrdering = 'desc';
-                        data.sort(function (a, b) {
-                            if (a.InvoiceNumber == null) {
-                                return -1;
-                            }
-                            if (b.InvoiceNumber == null) {
-                                return 1;
-                            }
-                            return (a.InvoiceNumber < b.InvoiceNumber) ? 1 : ((b.InvoiceNumber < a.InvoiceNumber) ? -1 : 0);
-                        });
-                    }
-                    parent.DeliveryNoteNumberColSort = 'no';
-                    parent.OrderCreateTimestampColSort = 'no';
-                    parent.ModifyTimestampColSort = 'no';
-                    parent.CompletedTimestampColSort = 'no';
-                    parent.FormattedStatusColSort = 'no';
-                    parent.InvoiceNumberForStatusColSort = 'no';
-                    parent.revenueColSort = 'no';
-                }
-                if (e.currentTarget.attributes['data-field'].nodeValue == 'revenue') {
-                    columnName = e.currentTarget.attributes['data-field'].nodeValue;
-                    if (parent.revenueColSort == 'no' || parent.revenueColSort == 'desc') {
-                        parent.revenueColSort = 'asc';
-                        columnOrdering = 'asc';
-                        data.sort(function (a, b) {
-                            return (a.revenue > b.revenue) ? 1 : ((b.revenue > a.revenue) ? -1 : 0);
-                        });
-                    } else {
-                        parent.revenueColSort = 'desc';
-                        columnOrdering = 'desc';
-                        data.sort(function (a, b) {
-                            return (a.revenue < b.revenue) ? 1 : ((b.revenue < a.revenue) ? -1 : 0);
-                        });
-                    }
-                    parent.DeliveryNoteNumberColSort = 'no';
-                    parent.OrderCreateTimestampColSort = 'no';
-                    parent.ModifyTimestampColSort = 'no';
-                    parent.CompletedTimestampColSort = 'no';
-                    parent.FormattedStatusColSort = 'no';
-                    parent.InvoiceNumberForStatusColSort = 'no';
-                    parent.InvoiceNumberColSort = 'no';
-                }
-                if (columnName !== '' && columnOrdering !== '') {
-                    var codeSetting = 'sortsForDN_' + columnName;
-                    var target = 'sortsForDN_';
-                    var value = columnOrdering;
+    refreshSelectOption: function (value, field) {
+        let fields = this.getFieldsSelect();
+        if (!isEmptyString(value) && fields.indexOf(field) !== -1) {
+            let available_option = this.getExistingOption(field);
+            if (available_option && available_option.indexOf(value) === -1) {
+                available_option.push(value);
+                available_option.sort();
 
-                    disabledElementForSlowConnection();
-
-                    App.api.user.changeSetting.put(target, codeSetting, value).then(function (resp) {
-                        var setting_value = resp.toString();
-                        var settings = _.clone(App.instance.thisUser.get('setting'));
-                        settings.sortsForDN_CompletedTimestamp = 'no';
-                        settings.sortsForDN_DeliveryNoteNumber = 'no';
-                        settings.sortsForDN_FormattedStatus = 'no';
-                        settings.sortsForDN_InvoiceNumber = 'no';
-                        settings.sortsForDN_ModifyTimestamp = 'no';
-                        settings.sortsForDN_OrderCreateTimestamp = 'no';
-                        settings.sortsForDN_revenue = 'no';
-                        if (settings) {
-                            if (codeSetting in settings) {
-                                settings[codeSetting] = setting_value;
-                            }
-                        } else {
-                            settings = [];
-                            settings[codeSetting] = setting_value;
-                        }
-                        App.instance.thisUser.set('setting', settings);
-
-                        includedElementForSlowConnection();
-                        parent.renderTax();
-                    });
-
-                    if (parent.clustered) {
-                        var groups = [];
-                        parent.groupsWithItems = [];
-                        data.forEach(function (item) {
-                            if (item.InvoiceNumber != undefined && groups.indexOf(item.InvoiceNumber) == -1) {
-                                groups.push(item.InvoiceNumber);
-                            }
-                        });
-                        groups.forEach(function (group) {
-                            var itemsGroup = {};
-                            itemsGroup.group = group;
-                            itemsGroup.items = [];
-                            itemsGroup.deliveryNoteNumbers = [];
-                            var elementIndex = 0;
-                            data.forEach(function (item) {
-                                if (item.InvoiceNumber != undefined && group == item.InvoiceNumber) {
-                                    itemsGroup.items.push(item.Id);
-                                    itemsGroup.deliveryNoteNumbers.push(item.DeliveryNoteNumber);
-                                }
-                                elementIndex++;
-                            });
-                            parent.groupsWithItems.push(itemsGroup);
-                        });
-                        parent.groupsWithItems.forEach(function (group) {
-                            if (group.items.length > 1) {
-                                var index = 0;
-                                var startIndex = data.map(function (x) {
-                                    return x.Id;
-                                }).indexOf(group.items[index]);
-                                index++;
-                                group.items.forEach(function (item) {
-                                    var buffIndex = data.map(function (x) {
-                                        return x.Id;
-                                    }).indexOf(group.items[index]);
-                                    if (buffIndex != -1) {
-                                        var objectForReplace = data.splice(buffIndex, 1);
-                                        data.splice(startIndex + 1, 0, objectForReplace[0]);
-                                        startIndex++;
-                                        index++;
-                                    }
-                                });
-                            }
-                        });
-                        var $table = $('#delivery-notes-table');
-                        $table.bootstrapTable('load', data);
-                        parent.groupsWithItems.forEach(function (gr) {
-                            var index = 0;
-                            var startIndex = data.map(function (x) {
-                                return x.Id;
-                            }).indexOf(gr.items[index]);
-                            $table.bootstrapTable('mergeCells', {
-                                index: startIndex,
-                                field: 'InvoiceNumber',
-                                rowspan: gr.items.length
-                            });
-                        });
-                        var tbl = parent.$el.find('#delivery-notes-table');
-                        var body = tbl.find('tbody');
-                        var trs = body.find('tr');
-                        trs.each(function () {
-                            var row = this;
-                            var num = row.cells[1].innerText;
-                            var num2 = row.cells[2].innerText;
-                            parent.groupsWithItems.forEach(function (gr) {
-                                gr.deliveryNoteNumbers.forEach(function (el) {
-                                    if (num.includes(el) || num2.includes(el)) {
-                                        row.group = gr.group;
-                                    }
-                                });
-                            });
-                        });
-
-                        trs.each(function () {
-                            var row = this;
-                            if (row.group != undefined) {
-                                $(row).mouseenter(function () {
-                                    trs.each(function () {
-                                        var rowMouse = this;
-                                        if (rowMouse.group == row.group) {
-                                            $(rowMouse).addClass('hover-row');
-                                        }
-                                    });
-                                });
-                                $(row).mouseleave(function () {
-                                    trs.each(function () {
-                                        var rowMouse = this;
-                                        if (rowMouse.group == row.group) {
-                                            $(rowMouse).removeClass('hover-row');
-                                        }
-                                    });
-                                });
-                            }
-                        });
-                    } else {
-                        var $table = $('#delivery-notes-table');
-                        $table.bootstrapTable('load', data);
-                    }
-                    parent.drawSorts();
-                    parent.$el.find('.show-delivery-note').each(function () {
-                        if (this.dataset.id == parent.lastClicked) {
-                            this.classList.add('last-clicked');
-                        }
-                    });
-                    parent.$el.find('.show-invoice').each(function () {
-                        if (this.dataset.id == parent.lastClickedInvoice) {
-                            this.classList.add('last-clicked');
-                        }
-                    });
-                    var showArrowsSummary;
-                    if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-                        showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-                        if (showArrowsSummary == 'false') {
-                            $('.arrowLineForTables span').css({'margin-left': '0'});
-                        }
-                    }
-                }
-            }
-        });
-    },
-    clustering: function () {
-        var parent = this;
-        var data = parent.filterPeriod(true);
-        var groups = [];
-        parent.groupsWithItems = [];
-        data.forEach(function (item) {
-            if (item.InvoiceNumber != undefined && groups.indexOf(item.InvoiceNumber) == -1) {
-                groups.push(item.InvoiceNumber);
-            }
-        });
-        groups.forEach(function (group) {
-            var itemsGroup = {};
-            itemsGroup.group = group;
-            itemsGroup.items = [];
-            itemsGroup.deliveryNoteNumbers = [];
-            var elementIndex = 0;
-            data.forEach(function (item) {
-                if (item.InvoiceNumber!= undefined && group == item.InvoiceNumber) {
-                    itemsGroup.items.push(item.Id);
-                    itemsGroup.deliveryNoteNumbers.push(item.DeliveryNoteNumber);
-                }
-                elementIndex++;
-            });
-            parent.groupsWithItems.push(itemsGroup);
-        });
-    },
-    toCluster: function () {
-        var parent = this;
-        var data = parent.filterPeriod(true);
-        if (parent.DeliveryNoteNumberColSort != 'no') {
-            if (parent.DeliveryNoteNumberColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.DeliveryNoteNumber > b.DeliveryNoteNumber) ? 1 : ((b.DeliveryNoteNumber > a.DeliveryNoteNumber) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.DeliveryNoteNumber < b.DeliveryNoteNumber) ? 1 : ((b.DeliveryNoteNumber < a.DeliveryNoteNumber) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.OrderCreateTimestampColSort != 'no') {
-            if (parent.OrderCreateTimestampColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.OrderCreateTimestamp < b.OrderCreateTimestamp) ? 1 : ((b.OrderCreateTimestamp < a.OrderCreateTimestamp) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.OrderCreateTimestamp > b.OrderCreateTimestamp) ? 1 : ((b.OrderCreateTimestamp > a.OrderCreateTimestamp) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.ModifyTimestampColSort != 'no') {
-            if (parent.ModifyTimestampColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.ModifyTimestamp < b.ModifyTimestamp) ? 1 : ((b.ModifyTimestamp < a.ModifyTimestamp) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.ModifyTimestamp > b.ModifyTimestamp) ? 1 : ((b.ModifyTimestamp > a.ModifyTimestamp) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.CompletedTimestampColSort != 'no') {
-            if (parent.CompletedTimestampColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.CompletedTimestamp < b.CompletedTimestamp) ? 1 : ((b.CompletedTimestamp < a.CompletedTimestamp) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.CompletedTimestamp > b.CompletedTimestamp) ? 1 : ((b.CompletedTimestamp > a.CompletedTimestamp) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.InvoiceNumberColSort != 'no') {
-            if (parent.InvoiceNumberColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.InvoiceNumber > b.InvoiceNumber) ? 1 : ((b.InvoiceNumber > a.InvoiceNumber) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-
-
-
-
-                    return (a.InvoiceNumber < b.InvoiceNumber) ? 1 : ((b.InvoiceNumber < a.InvoiceNumber) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.revenueColSort != 'no') {
-            if (parent.revenueColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.revenue > b.revenue) ? 1 : ((b.revenue > a.revenue) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.revenue < b.revenue) ? 1 : ((b.revenue < a.revenue) ? -1 : 0);
-                });
-            }
-        }
-        var groups = [];
-        parent.groupsWithItems = [];
-        data.forEach(function (item) {
-            if (item.InvoiceNumber != undefined && groups.indexOf(item.InvoiceNumber) == -1) {
-                groups.push(item.InvoiceNumber);
-            }
-        });
-        groups.forEach(function (group) {
-            var itemsGroup = {};
-            itemsGroup.group = group;
-            itemsGroup.items = [];
-            itemsGroup.deliveryNoteNumbers = [];
-            var elementIndex = 0;
-            data.forEach(function (item) {
-                if (item.InvoiceNumber!= undefined && group == item.InvoiceNumber) {
-                    itemsGroup.items.push(item.Id);
-                    itemsGroup.deliveryNoteNumbers.push(item.DeliveryNoteNumber);
-                }
-                elementIndex++;
-            });
-            parent.groupsWithItems.push(itemsGroup);
-        });
-        parent.groupsWithItems.forEach(function (group) {
-            if (group.items.length > 1) {
-                var index = 0;
-                var startIndex = data.map(function(x) {return x.Id; }).indexOf(group.items[index]);
-                index++;
-                group.items.forEach(function (item) {
-                    var buffIndex = data.map(function(x) {return x.Id; }).indexOf(group.items[index]);
-                    if (buffIndex != -1) {
-                        var objectForReplace = data.splice(buffIndex, 1);
-                        data.splice(startIndex + 1, 0, objectForReplace[0]);
-                        startIndex++;
-                        index++;
-                    }
-                });
-            }
-        });
-        var $table = $('#delivery-notes-table');
-        $table.bootstrapTable('load', data);
-        parent.groupsWithItems.forEach(function (gr) {
-            var index = 0;
-            var startIndex = data.map(function(x) {return x.Id; }).indexOf(gr.items[index]);
-            $table.bootstrapTable('mergeCells', {
-                index: startIndex,
-                field: 'InvoiceNumber',
-                rowspan: gr.items.length
-            });
-        });
-        var tbl = parent.$el.find('#delivery-notes-table');
-        var body = tbl.find('tbody');
-        var trs = body.find('tr');
-        trs.each(function () {
-            var row = this;
-            if (row.cells[1] != undefined) {
-                var num = row.cells[1].innerText;
-                var num2 = row.cells[2].innerText;
-                parent.groupsWithItems.forEach(function (gr) {
-                    gr.deliveryNoteNumbers.forEach(function (el) {
-                        if (num.includes(el) || num2.includes(el)) {
-                            row.group = gr.group;
-                        }
-                    });
-                });
-            }
-        });
-
-        trs.each(function () {
-            var row = this;
-            if (row.group != undefined) {
-                $(row).mouseenter( function() {
-                    trs.each(function () {
-                        var rowMouse = this;
-                        if (rowMouse.group == row.group) {
-                            $(rowMouse).addClass('hover-row');
-                        }
-                    });
-                });
-                $(row).mouseleave( function() {
-                    trs.each(function () {
-                        var rowMouse = this;
-                        if (rowMouse.group == row.group) {
-                            $(rowMouse).removeClass('hover-row');
-                        }
-                    });
-                });
-            }
-        });
-
-        var showArrowsSummary;
-        if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-            showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-            if (showArrowsSummary == 'false') {
-                $('.arrowLineForTables span').css({'margin-left': '0'});
+                this.renderSelectFilter(field);
             }
         }
     },
-    deCluster: function () {
-        var parent = this;
-        var data = parent.filterPeriod(true);
-        if (parent.DeliveryNoteNumberColSort != 'no') {
-            if (parent.DeliveryNoteNumberColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.DeliveryNoteNumber > b.DeliveryNoteNumber) ? 1 : ((b.DeliveryNoteNumber > a.DeliveryNoteNumber) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.DeliveryNoteNumber < b.DeliveryNoteNumber) ? 1 : ((b.DeliveryNoteNumber < a.DeliveryNoteNumber) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.OrderCreateTimestampColSort != 'no') {
-            if (parent.OrderCreateTimestampColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.OrderCreateTimestamp < b.OrderCreateTimestamp) ? 1 : ((b.OrderCreateTimestamp < a.OrderCreateTimestamp) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.OrderCreateTimestamp > b.OrderCreateTimestamp) ? 1 : ((b.OrderCreateTimestamp > a.OrderCreateTimestamp) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.ModifyTimestampColSort != 'no') {
-            if (parent.ModifyTimestampColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.ModifyTimestamp < b.ModifyTimestamp) ? 1 : ((b.ModifyTimestamp < a.ModifyTimestamp) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.ModifyTimestamp > b.ModifyTimestamp) ? 1 : ((b.ModifyTimestamp > a.ModifyTimestamp) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.CompletedTimestampColSort != 'no') {
-            if (parent.CompletedTimestampColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.CompletedTimestamp < b.CompletedTimestamp) ? 1 : ((b.CompletedTimestamp < a.CompletedTimestamp) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.CompletedTimestamp > b.CompletedTimestamp) ? 1 : ((b.CompletedTimestamp > a.CompletedTimestamp) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.InvoiceNumberColSort != 'no') {
-            if (parent.InvoiceNumberColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.InvoiceNumber > b.InvoiceNumber) ? 1 : ((b.InvoiceNumber > a.InvoiceNumber) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.InvoiceNumber < b.InvoiceNumber) ? 1 : ((b.InvoiceNumber < a.InvoiceNumber) ? -1 : 0);
-                });
-            }
-        }
-        if (parent.revenueColSort != 'no') {
-            if (parent.revenueColSort == 'asc') {
-                data.sort(function (a, b) {
-                    return (a.revenue > b.revenue) ? 1 : ((b.revenue > a.revenue) ? -1 : 0);
-                });
-            } else {
-                data.sort(function (a, b) {
-                    return (a.revenue < b.revenue) ? 1 : ((b.revenue < a.revenue) ? -1 : 0);
-                });
-            }
-        }
-        var $table = $('#delivery-notes-table');
-        $table.bootstrapTable('load', data);
+    isAllSelectedDocumentFinalized: function (_arguments) {
+        return _arguments.allFinalizedCanceled && !_arguments.hasCanceled;
     },
-    drawSorts: function () {
-        var parent = this;
-        var th = this.$el.find('#delivery-notes-table th');
-        th.each(function (i, head) {
-            if (head.attributes['data-field'].nodeValue == 'DeliveryNoteNumber') {
-                head.firstChild.className = head.firstChild.className.replace('both-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('asc-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('desc-sort', '');
-                if (parent.DeliveryNoteNumberColSort == 'no') {
-                    head.firstChild.className += " both-sort";
-                }
-                if (parent.DeliveryNoteNumberColSort == 'asc') {
-                    head.firstChild.className += " asc-sort";
-                }
-                if (parent.DeliveryNoteNumberColSort == 'desc') {
-                    head.firstChild.className += " desc-sort";
-                }
-            }
-            if (head.attributes['data-field'].nodeValue == 'OrderCreateTimestamp') {
-                head.firstChild.className = head.firstChild.className.replace('both-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('asc-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('desc-sort', '');
-                if (parent.OrderCreateTimestampColSort == 'no') {
-                    head.firstChild.className += " both-sort";
-                }
-                if (parent.OrderCreateTimestampColSort == 'asc') {
-                    head.firstChild.className += " asc-sort";
-                }
-                if (parent.OrderCreateTimestampColSort == 'desc') {
-                    head.firstChild.className += " desc-sort";
-                }
-            }
-            if (head.attributes['data-field'].nodeValue == 'ModifyTimestamp') {
-                head.firstChild.className = head.firstChild.className.replace('both-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('asc-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('desc-sort', '');
-                if (parent.ModifyTimestampColSort == 'no') {
-                    head.firstChild.className += " both-sort";
-                }
-                if (parent.ModifyTimestampColSort == 'asc') {
-                    head.firstChild.className += " asc-sort";
-                }
-                if (parent.ModifyTimestampColSort == 'desc') {
-                    head.firstChild.className += " desc-sort";
-                }
-            }
-            if (head.attributes['data-field'].nodeValue == 'CompletedTimestamp') {
-                head.firstChild.className = head.firstChild.className.replace('both-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('asc-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('desc-sort', '');
-                if (parent.CompletedTimestampColSort == 'no') {
-                    head.firstChild.className += " both-sort";
-                }
-                if (parent.CompletedTimestampColSort == 'asc') {
-                    head.firstChild.className += " asc-sort";
-                }
-                if (parent.CompletedTimestampColSort == 'desc') {
-                    head.firstChild.className += " desc-sort";
-                }
-            }
-            if (head.attributes['data-field'].nodeValue == 'InvoiceNumber') {
-                head.firstChild.className = head.firstChild.className.replace('both-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('asc-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('desc-sort', '');
-                if (parent.InvoiceNumberColSort == 'no') {
-                    head.firstChild.className += " both-sort";
-                }
-                if (parent.InvoiceNumberColSort == 'asc') {
-                    head.firstChild.className += " asc-sort";
-                }
-                if (parent.InvoiceNumberColSort == 'desc') {
-                    head.firstChild.className += " desc-sort";
-                }
-            }
-            if (head.attributes['data-field'].nodeValue == 'revenue') {
-                head.firstChild.className = head.firstChild.className.replace('both-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('asc-sort', '');
-                head.firstChild.className = head.firstChild.className.replace('desc-sort', '');
-                if (parent.revenueColSort == 'no') {
-                    head.firstChild.className += " both-sort";
-                }
-                if (parent.revenueColSort == 'asc') {
-                    head.firstChild.className += " asc-sort";
-                }
-                if (parent.revenueColSort == 'desc') {
-                    head.firstChild.className += " desc-sort";
-                }
-            }
-        });
+    renderMainButton: function () {
+        let isShowDeleteButton = App.instance.thisUser.getSetting('showButtonDeleteDocument')
+        if(isShowDeleteButton === 'false')
+            this.$buttonDeleteSelected.addClass('hidden');
+        else this.$buttonDeleteSelected.removeClass('hidden');
     },
-    changeCheckboxSetting: function(e){
-        e.preventDefault();
-        e.stopPropagation();
+    renderTd: function (value, field, new_data, index_row) {
+        this.setChanges(new_data);
+        this.visibleData[index_row] = new_data;
+        let html = value;
+        let option = this.getOptionColumn(field);
+        if (option !== undefined && option.hasOwnProperty('formatter'))
+            html = option.formatter(value, this.visibleData[index_row], index_row);
+        let index_column = this.getTable().find('th[data-field="' + field + '"]').index();
+        let $row = this.getRow(index_row);
+        let $td = this.getTd(index_row, index_column);
+        $td.html(html);
 
-        var codeSetting = e.target.getAttribute('id');
-        var target = this.$el.find('#' + codeSetting);
-        var value = target.prop('checked');
-
-        disabledElementForSlowConnection();
-
-        App.api.user.changeSetting.put(target[0].tagName.toLowerCase(), codeSetting, value).then(function (resp) {
-            var setting_value = resp.toString();
-            var settings = _.clone(App.instance.thisUser.get('setting'));
-
-            if (settings) {
-                if (codeSetting in settings) {
-                    settings[codeSetting] = setting_value;
-                }
-            } else {
-                settings = [];
-                settings[codeSetting] = setting_value;
-            }
-            App.instance.thisUser.set('setting', settings);
-
-            includedElementForSlowConnection();
-        });
+        this.setHandlersRow($row);
+        this.refreshSelectOption(value, field);
     },
-    replacementData: function(){
-        this.processedData = this.notes.toJSON();
-    },
-    changePeriodSetting: function(e) {
-        var self = this;
-        var codeSetting = 'periodForDN_' + e.target.getAttribute('id').split('-')[0] + 'Delivery';
-        var target = 'periodForDN_';
-        var value = 'true';
-        var elements = ['periodForDN_allDelivery',
-            'periodForDN_monthDelivery',
-            'periodForDN_sevendaysDelivery',
-            'periodForDN_todayDelivery',
-            'periodForDN_weekDelivery',
-            'periodForDN_yearDelivery',
-            'periodForDN_yesterdayDelivery'];
-        var showArrowsSummary;
-        disabledElementForSlowConnection();
-
-        App.api.user.changeSetting.put(target, codeSetting, value).then(function (resp) {
-            var setting_value = resp.toString();
-            var settings = _.clone(App.instance.thisUser.get('setting'));
-
-            _.map(elements, function(element) {
-                if (element in settings) {
-                    return settings[element] = 'false';
-                }
-            });
-
-            if (settings) {
-                if (codeSetting in settings) {
-                    settings[codeSetting] = setting_value;
-                }
-            } else {
-                settings = [];
-                settings[codeSetting] = setting_value;
-            }
-            App.instance.thisUser.set('setting', settings);
-
-            includedElementForSlowConnection();
-            if (typeof App.instance.thisUser.get('setting') !== 'undefined') {
-                showArrowsSummary = App.instance.thisUser.get('setting').showArrowsSummary;
-                if (showArrowsSummary == 'false') {
-                    $('.arrowLineForTables i').css({'display': 'none'});
-                    $('.arrowLineForTables span').css({'margin-left': '0'});
-                }
-            }
-        });
-
-        var dataForTopTable = this.recalculateTopTable($('#delivery-notes-table').bootstrapTable('getData'));
-
-        var todaySum = dataForTopTable.todaySum;
-        var todayMarAbs = dataForTopTable.todayMarAbs;
-        var todayMwst = dataForTopTable.todayMwst;
-        var thisWeekSum = dataForTopTable.thisWeekSum;
-        var thisWeekMarAbs = dataForTopTable.thisWeekMarAbs;
-        var thisWeekMwst = dataForTopTable.thisWeekMwst;
-        var thisMonthSum = dataForTopTable.thisMonthSum;
-        var thisMonthMarAbs = dataForTopTable.thisMonthMarAbs;
-        var thisMonthMwst = dataForTopTable.thisMonthMwst;
-        var thisYearSum = dataForTopTable.thisYearSum;
-        var thisYearMarAbs = dataForTopTable.thisYearMarAbs;
-        var thisYearMwst = dataForTopTable.thisYearMwst;
-        var documentTextColor = dataForTopTable.documentTextColor;
-        var todayTextColor = dataForTopTable.todayTextColor;
-        var thisWeekTextColor = dataForTopTable.thisWeekTextColor;
-        var thisMonthTextColor = dataForTopTable.thisMonthTextColor;
-        var thisYearTextColor = dataForTopTable.thisYearTextColor;
-
-        dataForTopTable.dataTop.forEach(function (value) {
-            var productTotalSum = value.SumTotalPrice;
-            var revenueString = formatProfitForPrint(productTotalSum);
-            var valueTax = 0.0;
-            value.Products.forEach(function (item) {
-                valueTax += item.TotalTax;
-            });
-            var productTotalSumWithTax = productTotalSum + valueTax;
-            var revenueBruttoString = formatProfitForPrint(productTotalSumWithTax);
-            if (revenueString === '-') {
-                value.revenue = '-';
-            } else {
-                var revenueInvoice = 0;
-
-                if (App.instance.invoices) {
-                    var invoice_id = value.InvoiceId;
-                    if (invoice_id !== null) {
-
-                        var Invoices_collection = App.instance.invoices;
-                        var invoice = Invoices_collection.get(invoice_id);
-
-                        if(invoice != undefined) {
-                            revenueInvoice = typeof invoice.get('SumTotalPrice') !== 'undefined' ? invoice.get('SumTotalPrice') : null;
-                            revenueInvoice = ' \u20AC ' + formatProfitForPrint(revenueInvoice);
-                        }
-                    } else {
-                        revenueInvoice = '-';
-                    }
-                }
-                documentTextColor = changeTextColorListDocumentsForDoc(value.containsDailyPriceCount);
-
-                var nettoHidedClass = self.currentUmsatz === 'netto' ? '' : ' hided-content';
-                var bruttoHidedClass = self.currentUmsatz === 'brutto' ? '' : ' hided-content';
-                value.revenue = '<div class="revenueLine' + nettoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueString + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>' +
-                    '<div class="revenueLineBruttoUmsatz' + bruttoHidedClass + '"><span class="' + documentTextColor + '">\u20AC ' + revenueBruttoString + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + ' %' + formatProfitForPrint(value.SumTotalProfitPercent) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + formatProfitForPrint(value.SumTotalProfitAbsolute) + '</span> / ' +
-                    '<span class="' + documentTextColor + '">' + revenueInvoice + '</span></div>';
-            }
-            // value.DeliveryNoteNumber = value.DeliveryNoteNumber + " (" + value.Company + ")";
-        });
-
-        this.renderTopTable(todaySum, todayMarAbs, todayMwst, thisWeekSum, thisWeekMarAbs, thisWeekMwst, thisMonthSum, thisMonthMarAbs, thisMonthMwst,
-            thisYearSum, thisYearMarAbs, thisYearMwst, documentTextColor, todayTextColor, thisWeekTextColor, thisMonthTextColor, thisYearTextColor);
-
-        if (self.currentUmsatz === 'brutto') {
-            var elementsToShow = document.getElementsByClassName('revenueLineBruttoUmsatz');
-            var elementsToHide = document.getElementsByClassName('revenueLine');
-            _.each(elementsToShow, function (row) {
-                row.classList.remove("hided-content");
-            });
-            _.each(elementsToHide, function (row) {
-                row.classList.add("hided-content");
-            });
+    returnLastClicked: function (html, $td) {
+        let $a_clicked = $td.find('a.last-clicked');
+        let result = html;
+        if($a_clicked.length === 1) {
+            let data_id = $a_clicked.data('id');
+            let $html_clicked = $(html);
+            $html_clicked.find('a[data-id="' + data_id + '"]').addClass('last-clicked');
+            result = $(html).html($html_clicked);
         }
+        return result;
     },
-    forSlowConnection: function (e) {
-        disabledElementForSlowConnection();
-    }
+    wasChangeMainNumber: function (Changes) {
+        return Changes.changed.hasOwnProperty('FormattedStatus')  || Changes.changed.hasOwnProperty('Products');
+    },
 });
